@@ -123,20 +123,41 @@ def create_overlay(
     )
     
     # Call the new helper function to render the red box
-    solid_width = _render_dynamic_red_box(
-        overlay=overlay,
-        draw=draw,
-        overlay_total_width=width,
-        box_y_start=red_box_y_start,
-        box_height_abs=red_box_height_abs,
-        display_name=display_name,
-        font_path=font_path,
-        volume_icon_path=volume_icon_path,
-        base_color_rgb=base_color_rgb
-    )
+    try:
+        solid_width = _render_dynamic_red_box(
+            overlay=overlay,
+            draw=draw,
+            overlay_total_width=width,
+            box_y_start=red_box_y_start,
+            box_height_abs=red_box_height_abs,
+            display_name=display_name,
+            font_path=font_path,
+            volume_icon_path=volume_icon_path,
+            base_color_rgb=base_color_rgb
+        )
+    except FileNotFoundError as e:
+        print(f"ERROR: Asset file not found - {e}")
+        print(f"Font path: {font_path}")
+        print(f"Volume icon path: {volume_icon_path}")
+        # List available files
+        import os
+        if os.path.exists("assets"):
+            print(f"Available assets: {os.listdir('assets')}")
+        raise Exception(f"Cannot open resource: {e}")
+    except Exception as e:
+        print(f"ERROR in _render_dynamic_red_box: {e}")
+        raise
 
     # 3. Position the person image
-    person_img = Image.open(person_image_path).convert("RGBA")
+    try:
+        person_img = Image.open(person_image_path).convert("RGBA")
+    except FileNotFoundError as e:
+        print(f"ERROR: Person image not found at {person_image_path}")
+        raise Exception(f"Cannot open person image: {e}")
+    except Exception as e:
+        print(f"ERROR opening person image: {e}")
+        raise Exception(f"Cannot open person image resource: {e}")
+    
     person_img_original_width, person_img_original_height = person_img.size
     person_width_abs = int(person_image_height_abs * person_img_original_width / person_img_original_height)
     
@@ -490,7 +511,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"Subtitle file created: {output_file}")
     return output_file
 
-def create_subtitle_v2_karaoke(word_captions, output_path, font_size=24):
+def create_subtitle_v2_karaoke(word_captions, output_path, font_size=24, max_chars_per_line=40, max_lines=2):
     """
     Create subtitle with word-by-word karaoke effect for v2
     
@@ -503,6 +524,8 @@ def create_subtitle_v2_karaoke(word_captions, output_path, font_size=24):
         word_captions: List of word tokens with start_ts, end_ts, and text
         output_path: Path to save the .ass file
         font_size: Font size for subtitles
+        max_chars_per_line: Maximum characters per line (default: 40)
+        max_lines: Maximum number of lines (default: 2)
     """
     
     # ASS color codes (BGR format in hex)
@@ -527,63 +550,127 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     # Position at 67.5% from the top
     pos_y = int(1080 * 0.675)
     
-    # Group captions into sentences/lines based on timing gaps
-    # A gap of more than 0.5 seconds indicates a new line
-    sentences = []
-    current_sentence = []
-    
+    # Merge punctuation with previous words
+    merged_captions = []
     for i, caption in enumerate(word_captions):
-        current_sentence.append(caption)
+        text = caption["text"]
         
-        # Check if this is the last word or if there's a significant gap to next word
-        is_last = i == len(word_captions) - 1
-        has_gap = False
-        
-        if not is_last:
-            next_caption = word_captions[i + 1]
-            gap = next_caption["start_ts"] - caption["end_ts"]
-            has_gap = gap > 0.5
-        
-        if is_last or has_gap:
-            sentences.append(current_sentence)
-            current_sentence = []
+        # Check if this is punctuation
+        if text in string.punctuation and merged_captions:
+            # Merge with previous word
+            merged_captions[-1]["text"] += text
+            merged_captions[-1]["end_ts"] = caption["end_ts"]
+        else:
+            # Add as new word
+            merged_captions.append(caption.copy())
     
-    # Generate ASS events for each sentence with word-by-word coloring
-    for sentence_words in sentences:
-        if not sentence_words:
+    # Group words into segments (max 2 lines, respecting character limit)
+    segments = []
+    current_segment = []
+    current_line_words = []
+    current_line_length = 0
+    current_line_num = 0
+    
+    for caption in merged_captions:
+        word = caption["text"]
+        word_length = len(word)
+        
+        # Check if adding this word would exceed line limit
+        potential_length = current_line_length + (1 if current_line_words else 0) + word_length
+        
+        if potential_length > max_chars_per_line and current_line_words:
+            # Line is full, move to next line
+            current_segment.extend(current_line_words)
+            current_line_words = []
+            current_line_length = 0
+            current_line_num += 1
+            
+            # If we've reached max lines, start new segment
+            if current_line_num >= max_lines:
+                segments.append(current_segment)
+                current_segment = []
+                current_line_num = 0
+        
+        # Add word to current line
+        current_line_words.append(caption)
+        current_line_length += (1 if current_line_length > 0 else 0) + word_length
+    
+    # Add remaining words
+    if current_line_words:
+        current_segment.extend(current_line_words)
+    if current_segment:
+        segments.append(current_segment)
+    
+    # Generate ASS events for each segment with word-by-word coloring
+    for segment_words in segments:
+        if not segment_words:
             continue
         
-        sentence_start = sentence_words[0]["start_ts"]
-        sentence_end = sentence_words[-1]["end_ts"]
+        segment_start = segment_words[0]["start_ts"]
+        segment_end = segment_words[-1]["end_ts"]
         
-        # For each word in the sentence, create an event that shows all words
+        # Break segment into lines for display (max 2 lines)
+        lines = []
+        current_line = []
+        current_length = 0
+        
+        for word_data in segment_words:
+            word = word_data["text"]
+            word_length = len(word)
+            potential_length = current_length + (1 if current_line else 0) + word_length
+            
+            if potential_length > max_chars_per_line and current_line:
+                lines.append(current_line)
+                current_line = []
+                current_length = 0
+            
+            current_line.append(word_data)
+            current_length += (1 if current_length > 0 else 0) + word_length
+        
+        if current_line:
+            lines.append(current_line)
+        
+        # Limit to max_lines
+        lines = lines[:max_lines]
+        
+        # For each word in the segment, create an event that shows all words
         # with colors changing based on timing
-        for word_idx, current_word in enumerate(sentence_words):
+        for word_idx, current_word in enumerate(segment_words):
             word_start = current_word["start_ts"]
             word_end = current_word["end_ts"]
             
-            # Build the full sentence with color tags
-            colored_sentence = ""
+            # Build the multi-line text with color tags
+            colored_lines = []
             
-            for idx, word in enumerate(sentence_words):
-                word_text = word["text"]
+            for line_words in lines:
+                colored_line = ""
+                for word_data in line_words:
+                    word_text = word_data["text"]
+                    
+                    # Find if this is before, at, or after current word
+                    word_index_in_segment = segment_words.index(word_data)
+                    
+                    if word_index_in_segment < word_idx:
+                        # Words already spoken - gray
+                        colored_line += f"{{\\c{COLOR_GRAY}}}{word_text}{{\\c}}"
+                    elif word_index_in_segment == word_idx:
+                        # Current word - green
+                        colored_line += f"{{\\c{COLOR_GREEN}}}{word_text}{{\\c}}"
+                    else:
+                        # Words not yet spoken - white (default)
+                        colored_line += f"{{\\c{COLOR_WHITE}}}{word_text}{{\\c}}"
+                    
+                    # Add space between words (except last in line)
+                    if word_data != line_words[-1]:
+                        colored_line += " "
                 
-                if idx < word_idx:
-                    # Words already spoken - gray
-                    colored_sentence += f"{{\\c{COLOR_GRAY}}}{word_text}{{\\c}}"
-                elif idx == word_idx:
-                    # Current word - green
-                    colored_sentence += f"{{\\c{COLOR_GREEN}}}{word_text}{{\\c}}"
-                else:
-                    # Words not yet spoken - white (default)
-                    colored_sentence += f"{{\\c{COLOR_WHITE}}}{word_text}{{\\c}}"
-                
-                # Add space between words (except last word)
-                if idx < len(sentence_words) - 1:
-                    colored_sentence += " "
+                colored_lines.append(colored_line)
+            
+            # Join lines with \N (line break in ASS)
+            formatted_text = "\\N".join(colored_lines)
             
             # Position at center
-            formatted_text = f"{{\\pos(960,{pos_y})}}" + colored_sentence
+            formatted_text = f"{{\\pos(960,{pos_y})}}" + formatted_text
             
             # Create the dialogue line for this word's duration
             start_time = format_time(word_start)
@@ -591,18 +678,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             
             ass_content += f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{formatted_text}\n"
         
-        # Add final state with all words gray after sentence ends
-        all_gray = ""
-        for idx, word in enumerate(sentence_words):
-            all_gray += f"{{\\c{COLOR_GRAY}}}{word['text']}{{\\c}}"
-            if idx < len(sentence_words) - 1:
-                all_gray += " "
+        # Add final state with all words gray after segment ends
+        gray_lines = []
+        for line_words in lines:
+            gray_line = ""
+            for word_data in line_words:
+                gray_line += f"{{\\c{COLOR_GRAY}}}{word_data['text']}{{\\c}}"
+                if word_data != line_words[-1]:
+                    gray_line += " "
+            gray_lines.append(gray_line)
         
-        formatted_final = f"{{\\pos(960,{pos_y})}}" + all_gray
-        final_start = format_time(sentence_end)
+        formatted_final = "\\N".join(gray_lines)
+        formatted_final = f"{{\\pos(960,{pos_y})}}" + formatted_final
+        final_start = format_time(segment_end)
         
-        # Show gray state for 0.3 seconds after sentence ends
-        final_end = format_time(sentence_end + 0.3)
+        # Show gray state for 0.3 seconds after segment ends
+        final_end = format_time(segment_end + 0.3)
         
         ass_content += f"Dialogue: 0,{final_start},{final_end},Default,,0,0,0,,{formatted_final}\n"
     
