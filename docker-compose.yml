@@ -20,6 +20,11 @@ services:
       - CUDA=0  # Mude para 1 se tiver GPU NVIDIA
       # Opcional: configure mais variáveis aqui
       # - NUM_THREADS=8
+    # Configuração de DNS para resolver domínios externos
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+      - 1.1.1.1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
