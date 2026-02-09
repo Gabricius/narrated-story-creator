@@ -5,6 +5,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Criar diretório de trabalho
@@ -19,29 +20,45 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Criar diretórios necessários
 RUN mkdir -p /app/assets /app/tmp /app/videos
 
-# Copiar arquivos da aplicação
+# Copiar arquivos da aplicação (estes SÃO obrigatórios)
 COPY server.py .
 COPY video_maker.py .
 
-# Copiar assets obrigatórios (fontes)
-COPY anton.ttf assets/
-COPY arial.ttf assets/
-COPY noto.ttf assets/
-COPY noto_hindi.ttf assets/
-
-# Copiar ícone se existir, caso contrário criar um placeholder
-# Isso evita que o build falhe se o arquivo não existir
-COPY icon_volume.png assets/ || true
-
-# Criar ícone placeholder se não existir
+# Script para obter assets (fontes e ícone)
+# Este script baixa os arquivos automaticamente
 RUN python3 << 'EOF'
 import os
+import urllib.request
 from pathlib import Path
 
-icon_path = Path('/app/assets/icon_volume.png')
+assets_dir = Path('/app/assets')
+assets_dir.mkdir(exist_ok=True)
 
+# Definir fontes necessárias
+fonts = {
+    'anton.ttf': 'https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf',
+    'arial.ttf': 'https://github.com/matomo-org/travis-scripts/raw/master/fonts/Arial.ttf',
+    'noto.ttf': 'https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Regular.ttf',
+    'noto_hindi.ttf': 'https://github.com/google/fonts/raw/main/ofl/notosansdevanagari/NotoSansDevanagari-Regular.ttf',
+}
+
+print("📥 Downloading required fonts...")
+for filename, url in fonts.items():
+    target = assets_dir / filename
+    if target.exists():
+        print(f"✓ {filename} already exists")
+    else:
+        try:
+            print(f"⬇️  Downloading {filename}...")
+            urllib.request.urlretrieve(url, str(target))
+            print(f"✓ {filename} downloaded successfully")
+        except Exception as e:
+            print(f"⚠️  Could not download {filename}: {e}")
+
+# Criar ícone de volume
+icon_path = assets_dir / 'icon_volume.png'
 if not icon_path.exists():
-    print("Warning: icon_volume.png not found, creating placeholder...")
+    print("🎨 Creating volume icon...")
     try:
         from PIL import Image, ImageDraw
         
@@ -49,25 +66,30 @@ if not icon_path.exists():
         img = Image.new('RGBA', (512, 512), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         
-        # Desenhar um alto-falante simples
-        # Corpo do alto-falante
-        draw.rectangle([100, 200, 200, 312], fill='white', outline='black', width=3)
+        # Desenhar alto-falante
+        # Corpo
+        draw.rectangle([100, 200, 200, 312], fill='white', outline='black', width=4)
         # Cone
         draw.polygon([(200, 200), (300, 150), (300, 362), (200, 312)], fill='white', outline='black')
+        
         # Ondas sonoras
         for i in range(3):
             offset = 50 + (i * 40)
             draw.arc([300+offset, 200-offset, 400+offset, 312+offset], 
-                    start=-45, end=45, fill='white', width=8)
+                    start=-45, end=45, fill='white', width=10)
         
-        img.save(icon_path)
-        print(f"Created placeholder icon at {icon_path}")
+        img.save(str(icon_path))
+        print(f"✓ Volume icon created at {icon_path}")
     except Exception as e:
-        print(f"Could not create icon: {e}")
-        print("Continuing without icon - application may have issues")
+        print(f"⚠️  Could not create icon: {e}")
 else:
-    print(f"Found icon_volume.png at {icon_path}")
+    print(f"✓ icon_volume.png already exists")
+
+print("✅ All assets ready!")
 EOF
+
+# Verificar se os assets foram criados
+RUN ls -lah /app/assets/
 
 # Expor porta da API
 EXPOSE 8000
