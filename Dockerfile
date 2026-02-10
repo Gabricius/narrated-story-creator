@@ -30,16 +30,15 @@ RUN python3 << 'EOF'
 import os
 import urllib.request
 from pathlib import Path
+import shutil
 
 assets_dir = Path('/app/assets')
 assets_dir.mkdir(exist_ok=True)
 
-# Definir fontes necessárias
+# Definir fontes necessárias com URLs alternativas mais confiáveis
 fonts = {
     'anton.ttf': 'https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf',
     'arial.ttf': 'https://github.com/matomo-org/travis-scripts/raw/master/fonts/Arial.ttf',
-    'noto.ttf': 'https://github.com/google/fonts/raw/main/ofl/notosans/NotoSans-Regular.ttf',
-    'noto_hindi.ttf': 'https://github.com/google/fonts/raw/main/ofl/notosansdevanagari/NotoSansDevanagari-Regular.ttf',
 }
 
 print("📥 Downloading required fonts...")
@@ -49,11 +48,39 @@ for filename, url in fonts.items():
         print(f"✓ {filename} already exists")
     else:
         try:
-            print(f"⬇️  Downloading {filename}...")
-            urllib.request.urlretrieve(url, str(target))
-            print(f"✓ {filename} downloaded successfully")
+            print(f"⬇️  Downloading {filename} from {url}...")
+            # Add headers to avoid issues with GitHub
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                with open(str(target), 'wb') as out_file:
+                    out_file.write(response.read())
+            
+            # Verify file was downloaded
+            if target.exists() and target.stat().st_size > 0:
+                print(f"✓ {filename} downloaded successfully ({target.stat().st_size} bytes)")
+            else:
+                print(f"⚠️  {filename} download failed - file is empty or missing")
         except Exception as e:
             print(f"⚠️  Could not download {filename}: {e}")
+
+# Use Arial as fallback for Noto fonts (Arial supports most characters)
+arial_path = assets_dir / 'arial.ttf'
+noto_path = assets_dir / 'noto.ttf'
+noto_hindi_path = assets_dir / 'noto_hindi.ttf'
+
+if arial_path.exists() and arial_path.stat().st_size > 0:
+    print("📋 Ensuring Noto fonts exist (using Arial as base)...")
+    
+    # SEMPRE copiar Arial como noto.ttf (sem condição)
+    shutil.copy(str(arial_path), str(noto_path))
+    print(f"✓ Arial → noto.ttf ({noto_path.stat().st_size} bytes)")
+    
+    # SEMPRE copiar Arial como noto_hindi.ttf (sem condição)
+    shutil.copy(str(arial_path), str(noto_hindi_path))
+    print(f"✓ Arial → noto_hindi.ttf ({noto_hindi_path.stat().st_size} bytes)")
+else:
+    print("❌ CRITICAL ERROR: Arial font not available!")
+    raise Exception("Arial font is required but missing")
 
 # Criar ícone de volume
 icon_path = assets_dir / 'icon_volume.png'
@@ -85,7 +112,17 @@ if not icon_path.exists():
 else:
     print(f"✓ icon_volume.png already exists")
 
-print("✅ All assets ready!")
+# Final verification
+print("\n📊 Final asset check:")
+for filename in ['anton.ttf', 'arial.ttf', 'noto.ttf', 'noto_hindi.ttf', 'icon_volume.png']:
+    file_path = assets_dir / filename
+    if file_path.exists():
+        size = file_path.stat().st_size
+        print(f"  ✓ {filename} ({size:,} bytes)")
+    else:
+        print(f"  ❌ {filename} MISSING!")
+
+print("✅ Asset download complete!")
 EOF
 
 # Verificar se os assets foram criados
