@@ -602,12 +602,28 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         segments.append(current_segment)
     
     # Generate ASS events for each segment with word-by-word coloring
-    for segment_words in segments:
+    # CRITICAL: Track segment end times to prevent overlap
+    segment_end_times = []
+    
+    for seg_idx, segment_words in enumerate(segments):
         if not segment_words:
             continue
         
         segment_start = segment_words[0]["start_ts"]
         segment_end = segment_words[-1]["end_ts"]
+        
+        # If this is not the first segment, ensure it starts AFTER previous segment ends
+        if seg_idx > 0 and segment_end_times:
+            previous_end = segment_end_times[-1]
+            # Add 0.05s gap to prevent any overlap
+            if segment_start < previous_end + 0.05:
+                segment_start = previous_end + 0.05
+                # Adjust all word timings in this segment
+                time_shift = segment_start - segment_words[0]["start_ts"]
+                for word_data in segment_words:
+                    word_data["start_ts"] += time_shift
+                    word_data["end_ts"] += time_shift
+                segment_end = segment_words[-1]["end_ts"]
         
         # Break segment into lines for display (max 2 lines)
         lines = []
@@ -678,69 +694,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             
             ass_content += f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{formatted_text}\n"
         
-        # Add final state with all words gray after segment ends
-        gray_lines = []
-        for line_words in lines:
-            gray_line = ""
-            for word_data in line_words:
-                gray_line += f"{{\\c{COLOR_GRAY}}}{word_data['text']}{{\\c}}"
-                if word_data != line_words[-1]:
-                    gray_line += " "
-            gray_lines.append(gray_line)
+        # DO NOT add final gray state - this causes overlap
+        # The segment simply ends when the last word ends
         
-        formatted_final = "\\N".join(gray_lines)
-        formatted_final = f"{{\\pos(960,{pos_y})}}" + formatted_final
-        final_start = format_time(segment_end)
-        
-        # Show gray state briefly (0.1s) - not too long to avoid overlap
-        final_end = format_time(segment_end + 0.1)
-        
-        ass_content += f"Dialogue: 0,{final_start},{final_end},Default,,0,0,0,,{formatted_final}\n"
-    
-    # Post-processing: Add gap between segments to prevent overlap
-    # Parse the dialogue lines to adjust timing
-    lines = ass_content.split('\n')
-    dialogue_lines = []
-    other_lines = []
-    
-    for line in lines:
-        if line.startswith('Dialogue:'):
-            dialogue_lines.append(line)
-        else:
-            other_lines.append(line)
-    
-    # Group dialogues by segment (same start time indicates same segment)
-    segments_dialogues = []
-    current_segment_lines = []
-    last_start = None
-    
-    for line in dialogue_lines:
-        if not line.strip():
-            continue
-        # Extract start time from dialogue
-        parts = line.split(',')
-        if len(parts) >= 3:
-            start_time = parts[1]
-            if last_start is None or start_time != last_start:
-                if current_segment_lines:
-                    segments_dialogues.append(current_segment_lines)
-                current_segment_lines = []
-                last_start = start_time
-            current_segment_lines.append(line)
-    
-    if current_segment_lines:
-        segments_dialogues.append(current_segment_lines)
-    
-    # Rebuild ASS content with proper timing
-    ass_content = '\n'.join(other_lines[:other_lines.index('[Events]') + 2]) + '\n'
-    
-    for i, segment_lines in enumerate(segments_dialogues):
-        # Add all lines from this segment
-        for line in segment_lines:
-            ass_content += line + '\n'
-        
-        # Gap between segments is handled by the brief gray state (0.1s)
-        # which prevents overlap automatically
+        # Track this segment's end time
+        segment_end_times.append(segment_end)
     
     # Write the subtitle file
     with open(output_path, 'w', encoding='utf-8') as f:
