@@ -612,17 +612,18 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         segment_start = segment_words[0]["start_ts"]
         segment_end = segment_words[-1]["end_ts"]
         
-        # If this is not the first segment, ensure it starts AFTER previous segment ends
+        # If this is not the first segment, ensure it starts EXACTLY when previous ends
+        # NO gap, NO overlap - instant transition
         if seg_idx > 0 and segment_end_times:
             previous_end = segment_end_times[-1]
-            # Add 0.05s gap to prevent any overlap
-            if segment_start < previous_end + 0.05:
-                segment_start = previous_end + 0.05
-                # Adjust all word timings in this segment
-                time_shift = segment_start - segment_words[0]["start_ts"]
+            # Start exactly at previous end (no gap, no overlap)
+            if segment_start < previous_end:
+                # Shift this segment to start right after previous
+                time_shift = previous_end - segment_words[0]["start_ts"]
                 for word_data in segment_words:
                     word_data["start_ts"] += time_shift
                     word_data["end_ts"] += time_shift
+                segment_start = segment_words[0]["start_ts"]
                 segment_end = segment_words[-1]["end_ts"]
         
         # Break segment into lines for display (max 2 lines)
