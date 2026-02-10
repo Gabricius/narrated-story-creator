@@ -739,9 +739,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for line in segment_lines:
             ass_content += line + '\n'
         
-        # Add small gap (0.05s) before next segment to prevent overlap
-        if i < len(segments_dialogues) - 1:
-            # This gap is handled by the gray state end time being brief
+        # Gap between segments is handled by the brief gray state (0.1s)
+        # which prevents overlap automatically
     
     # Write the subtitle file
     with open(output_path, 'w', encoding='utf-8') as f:
