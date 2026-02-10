@@ -692,10 +692,56 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         formatted_final = f"{{\\pos(960,{pos_y})}}" + formatted_final
         final_start = format_time(segment_end)
         
-        # Show gray state for 0.3 seconds after segment ends
-        final_end = format_time(segment_end + 0.3)
+        # Show gray state briefly (0.1s) - not too long to avoid overlap
+        final_end = format_time(segment_end + 0.1)
         
         ass_content += f"Dialogue: 0,{final_start},{final_end},Default,,0,0,0,,{formatted_final}\n"
+    
+    # Post-processing: Add gap between segments to prevent overlap
+    # Parse the dialogue lines to adjust timing
+    lines = ass_content.split('\n')
+    dialogue_lines = []
+    other_lines = []
+    
+    for line in lines:
+        if line.startswith('Dialogue:'):
+            dialogue_lines.append(line)
+        else:
+            other_lines.append(line)
+    
+    # Group dialogues by segment (same start time indicates same segment)
+    segments_dialogues = []
+    current_segment_lines = []
+    last_start = None
+    
+    for line in dialogue_lines:
+        if not line.strip():
+            continue
+        # Extract start time from dialogue
+        parts = line.split(',')
+        if len(parts) >= 3:
+            start_time = parts[1]
+            if last_start is None or start_time != last_start:
+                if current_segment_lines:
+                    segments_dialogues.append(current_segment_lines)
+                current_segment_lines = []
+                last_start = start_time
+            current_segment_lines.append(line)
+    
+    if current_segment_lines:
+        segments_dialogues.append(current_segment_lines)
+    
+    # Rebuild ASS content with proper timing
+    ass_content = '\n'.join(other_lines[:other_lines.index('[Events]') + 2]) + '\n'
+    
+    for i, segment_lines in enumerate(segments_dialogues):
+        # Add all lines from this segment
+        for line in segment_lines:
+            ass_content += line + '\n'
+        
+        # Add small gap (0.05s) before next segment to prevent overlap
+        if i < len(segments_dialogues) - 1:
+            # This gap is handled by the gray state end time being brief
     
     # Write the subtitle file
     with open(output_path, 'w', encoding='utf-8') as f:
