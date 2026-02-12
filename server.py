@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Literal, Optional, Annotated
 from contextlib import asynccontextmanager
 from pydantic import Field
@@ -124,6 +125,16 @@ async def lifespan(app: FastAPI):
     save_videos()
 
 app = FastAPI(lifespan=lifespan)
+
+# CORS — allow Pipeline Manager and any frontend to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 mcp = FastMCP(name="NarratedStoryMakerMCP", stateless_http=True)
 active_connections = set()
 
@@ -406,21 +417,52 @@ ASPECT_RATIO_MAP = {
     "SQUARE": "IMAGE_ASPECT_RATIO_SQUARE",
 }
 
+def extract_bearer_token(raw: str) -> str:
+    """Extract a ya29.* bearer token from various input formats.
+    
+    Accepts:
+    - Raw bearer token: "ya29.a0ABC..."
+    - Cookie header string containing the token somewhere
+    - "Bearer ya29.a0ABC..."
+    
+    Returns the clean token or None if not found.
+    """
+    raw = raw.strip()
+    # Remove "Bearer " prefix if present
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    # If it starts with ya29, it's already the token
+    if raw.startswith("ya29."):
+        return raw
+    # Try to find ya29 token inside a cookie string or other text
+    import re
+    match = re.search(r'(ya29\.[A-Za-z0-9_\-\.]+)', raw)
+    if match:
+        return match.group(1)
+    return None
+
 @app.post("/api/generate-image")
 def generate_imagefx(req: dict):
     """Generate an image using Google ImageFX API.
     
     Body: { "cookie": "ya29...", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
-    Returns: { "image_url": "/api/imagefx/{image_id}", "image_id": "..." }
+    The "cookie" field accepts a Bearer token (ya29.*) or a cookie string containing one.
     """
-    cookie = req.get("cookie", "").strip()
+    raw_token = req.get("cookie", "").strip()
     prompt = req.get("prompt", "").strip()
     aspect_ratio = req.get("aspect_ratio", "LANDSCAPE").upper()
     
-    if not cookie:
-        return JSONResponse(content={"error": "cookie (bearer token) is required"}, status_code=400)
+    if not raw_token:
+        return JSONResponse(content={"error": "Bearer token is required (field: cookie)"}, status_code=400)
     if not prompt:
         return JSONResponse(content={"error": "prompt is required"}, status_code=400)
+    
+    token = extract_bearer_token(raw_token)
+    if not token:
+        return JSONResponse(
+            content={"error": "Token inválido. Cole o Bearer Token que começa com ya29."},
+            status_code=400
+        )
     
     ar_value = ASPECT_RATIO_MAP.get(aspect_ratio, "IMAGE_ASPECT_RATIO_LANDSCAPE")
     seed = random.randint(1, 2**31)
@@ -440,7 +482,7 @@ def generate_imagefx(req: dict):
     }
     
     headers = {
-        "Authorization": f"Bearer {cookie}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Origin": "https://aisandbox.google.com",
         "Referer": "https://aisandbox.google.com/",
@@ -518,9 +560,13 @@ def test_imagefx_token(req: dict):
     Body: { "cookie": "ya29..." }
     Returns: { "valid": true/false, "message": "..." }
     """
-    cookie = req.get("cookie", "").strip()
-    if not cookie:
+    raw_token = req.get("cookie", "").strip()
+    if not raw_token:
         return JSONResponse(content={"valid": False, "message": "Token vazio"}, status_code=400)
+    
+    token = extract_bearer_token(raw_token)
+    if not token:
+        return {"valid": False, "message": "Token inválido. Use o Bearer Token (começa com ya29.), não o cookie de sessão."}
     
     # Use a minimal test prompt
     seed = random.randint(1, 2**31)
@@ -539,7 +585,7 @@ def test_imagefx_token(req: dict):
     }
     
     headers = {
-        "Authorization": f"Bearer {cookie}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Origin": "https://aisandbox.google.com",
         "Referer": "https://aisandbox.google.com/",
