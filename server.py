@@ -19,7 +19,27 @@ import sys
 import base64
 import json
 import random
+import re
 import torch
+
+def normalize_drive_url(url: str) -> str:
+    """Convert Google Drive share/view links to direct download URLs.
+    
+    Input:  https://drive.google.com/file/d/FILE_ID/view?usp=drive_link
+    Output: https://drive.google.com/uc?export=download&id=FILE_ID&confirm=t
+    
+    The confirm=t parameter helps bypass the virus scan confirmation page for large files.
+    """
+    if not url:
+        return url
+    match = re.search(r'drive\.google\.com/file/d/([^/?]+)', url)
+    if match:
+        file_id = match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+    # Already a uc? link — add confirm=t if missing
+    if 'drive.google.com/uc?' in url and 'confirm=' not in url:
+        return url + ('&' if '?' in url else '?') + 'confirm=t'
+    return url
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.routing import Mount
@@ -198,11 +218,12 @@ def process_video_queue():
                     try:
                         # Download background video
                         print(f"Downloading background video for {video_id}")
-                        bg_extension = os.path.splitext(data["bg_video_url"])[1]
+                        download_url = normalize_drive_url(data["bg_video_url"])
+                        bg_extension = os.path.splitext(download_url.split('?')[0])[1]
                         if not bg_extension or len(bg_extension) > 5:
                             bg_extension = ".mp4"
                         bg_video_path = os.path.join(video_dir, f"background{bg_extension}")
-                        response = requests.get(data["bg_video_url"], stream=True, timeout=120, allow_redirects=True)
+                        response = requests.get(download_url, stream=True, timeout=120, allow_redirects=True)
                         if response.status_code == 200:
                             with open(bg_video_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
@@ -212,11 +233,12 @@ def process_video_queue():
                         
                         # Download person image
                         print(f"Downloading person image for {video_id}")
-                        person_extension = os.path.splitext(data["person_image_url"])[1]
+                        person_download_url = normalize_drive_url(data["person_image_url"])
+                        person_extension = os.path.splitext(person_download_url.split('?')[0])[1]
                         if not person_extension or len(person_extension) > 5:
                             person_extension = ".png"
                         person_image_path = os.path.join(video_dir, f"person{person_extension}")
-                        response = requests.get(data["person_image_url"], stream=True, timeout=60, allow_redirects=True)
+                        response = requests.get(person_download_url, stream=True, timeout=60, allow_redirects=True)
                         if response.status_code == 200:
                             with open(person_image_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
