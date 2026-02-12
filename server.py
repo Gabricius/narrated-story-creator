@@ -474,7 +474,7 @@ def generate_imagefx(req: dict):
         print(f"[ImageFX] Got access token: {access_token[:20]}...")
     except Exception as e:
         return JSONResponse(
-            content={"error": f"Falha na autenticação: {str(e)}"},
+            content={"error": f"Falha na autenticação: {str(e)}", "auth_expired": True},
             status_code=401
         )
     
@@ -506,7 +506,7 @@ def generate_imagefx(req: dict):
         
         if resp.status_code == 401 or resp.status_code == 403:
             return JSONResponse(
-                content={"error": f"Token expirado ou inválido (HTTP {resp.status_code})"},
+                content={"error": f"Token expirado ou inválido (HTTP {resp.status_code})", "auth_expired": True},
                 status_code=resp.status_code
             )
         
