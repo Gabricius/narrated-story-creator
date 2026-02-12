@@ -15,6 +15,9 @@ import os
 import atexit
 import signal
 import sys
+import base64
+import json
+import random
 import torch
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
@@ -73,90 +76,21 @@ def iterfile(path: str):
             yield chunk
 
 LANGUAGE_CONFIG = {
-    'en-us': {
-        'lang_code': 'a',
-        'international': False,
-    },
-    'en': {
-        'lang_code': 'a',
-        'international': False,
-    },
-    'en-gb': {
-        'lang_code': 'b',
-        'international': False,
-    },
-    'es': {
-        'lang_code': 'e',
-        'international': True
-    },
-    'fr': {
-        'lang_code': 'f',
-        'international': True
-    },
-    'hi': {
-        'lang_code': 'h',
-        'international': True
-    },
-    'it': {
-        'lang_code': 'i',
-        'international': True
-    },
-    'pt': {
-        'lang_code': 'p',
-        'international': True
-    },
-    'ja': {
-        'lang_code': 'j',
-        'international': True
-    },
-    'zh': {
-        'lang_code': 'z',
-        'international': True
-    },
+    'en-us': {'lang_code': 'a', 'international': False},
+    'en': {'lang_code': 'a', 'international': False},
+    'en-gb': {'lang_code': 'b', 'international': False},
+    'es': {'lang_code': 'e', 'international': True},
+    'fr': {'lang_code': 'f', 'international': True},
+    'hi': {'lang_code': 'h', 'international': True},
+    'it': {'lang_code': 'i', 'international': True},
+    'pt': {'lang_code': 'p', 'international': True},
+    'ja': {'lang_code': 'j', 'international': True},
+    'zh': {'lang_code': 'z', 'international': True},
 }
 LANGUAGE_VOICE_CONFIG = {
-    'en-us': [
-        'af_heart',
-        'af_alloy', 
-        'af_aoede', 
-        'af_bella', 
-        'af_jessica',
-        'af_kore', 
-        'af_nicole', 
-        'af_nova', 
-        'af_river', 
-        'af_sarah', 
-        'af_sky',
-        'am_adam',
-        'am_echo',
-        'am_eric',
-        'am_fenrir',
-        'am_liam',
-        'am_michael',
-        'am_onyx',
-        'am_puck',
-        'am_santa'
-    ],
-    'en-gb': [
-        'bf_alice',
-        'bf_emma',
-        'bf_isabella',
-        'bf_lily',
-        'bm_daniel',
-        'bm_fable',
-        'bm_george',
-        'bm_lewis'
-    ],
-    'zh': [
-        'zf_xiaobei',
-        'zf_xiaoni',
-        'zf_xiaoxiao',
-        'zf_xiaoyi',
-        'zm_yunjian',
-        'zm_yunxi',
-        'zm_yunxia',
-        'zm_yunyang'
-    ],
+    'en-us': ['af_heart','af_alloy','af_aoede','af_bella','af_jessica','af_kore','af_nicole','af_nova','af_river','af_sarah','af_sky','am_adam','am_echo','am_eric','am_fenrir','am_liam','am_michael','am_onyx','am_puck','am_santa'],
+    'en-gb': ['bf_alice','bf_emma','bf_isabella','bf_lily','bm_daniel','bm_fable','bm_george','bm_lewis'],
+    'zh': ['zf_xiaobei','zf_xiaoni','zf_xiaoxiao','zf_xiaoyi','zm_yunjian','zm_yunxi','zm_yunxia','zm_yunyang'],
     'es': ['ef_dora', 'em_alex', 'em_santa'],
     'fr': ['ff_siwis'],
     'it': ['if_sara', 'im_nicola'],
@@ -182,9 +116,7 @@ async def lifespan(app: FastAPI):
     load_videos()
     worker_thread = threading.Thread(target=process_video_queue, daemon=True)
     worker_thread.start()
-    
     yield
-    
     global worker_running
     worker_running = False
     if worker_thread.is_alive():
@@ -216,16 +148,15 @@ def load_videos():
             if 'videos' in db:
                 videos = db['videos']
                 print(f"Loaded {len(videos)} videos from persistent storage")
-                # Re-queue videos that were in QUEUED state
                 for video_id, video_data in videos.items():
                     if video_data['status'] == VideoStatus.QUEUED:
                         video_queue.put(video_id)
-                    # Reset videos that were in PROCESSING state (they were interrupted)
                     elif video_data['status'] == VideoStatus.PROCESSING:
                         video_data['status'] = VideoStatus.QUEUED
                         video_queue.put(video_id)
     except Exception as e:
         print(f"Error loading videos from persistent storage: {e}")
+
 def save_videos():
     try:
         with shelve.open(SHELVE_FILE_PATH) as db:
@@ -236,24 +167,20 @@ def save_videos():
 
 atexit.register(save_videos)
 
-# worker thread for processing videos
 video_queue = queue.Queue()
 videos = {}
 worker_lock = threading.Lock()
 worker_running = True
+
 def process_video_queue():
     while worker_running:
         try:
             if not video_queue.empty():
                 video_id = video_queue.get()
                 if video_id in videos:
-                    # Set status to processing
                     videos[video_id]["status"] = VideoStatus.PROCESSING
-                    save_videos()  # Save state change
-                    
+                    save_videos()
                     data = videos[video_id]["data"]
-                    
-                    # Create video directory
                     video_dir = os.path.join(TMP_DIR, video_id)
                     os.makedirs(video_dir, exist_ok=True)
                     
@@ -261,8 +188,10 @@ def process_video_queue():
                         # Download background video
                         print(f"Downloading background video for {video_id}")
                         bg_extension = os.path.splitext(data["bg_video_url"])[1]
+                        if not bg_extension or len(bg_extension) > 5:
+                            bg_extension = ".mp4"
                         bg_video_path = os.path.join(video_dir, f"background{bg_extension}")
-                        response = requests.get(data["bg_video_url"], stream=True, timeout=60)
+                        response = requests.get(data["bg_video_url"], stream=True, timeout=120, allow_redirects=True)
                         if response.status_code == 200:
                             with open(bg_video_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
@@ -273,17 +202,17 @@ def process_video_queue():
                         # Download person image
                         print(f"Downloading person image for {video_id}")
                         person_extension = os.path.splitext(data["person_image_url"])[1]
+                        if not person_extension or len(person_extension) > 5:
+                            person_extension = ".png"
                         person_image_path = os.path.join(video_dir, f"person{person_extension}")
-                        response = requests.get(data["person_image_url"], stream=True, timeout=60)
+                        response = requests.get(data["person_image_url"], stream=True, timeout=60, allow_redirects=True)
                         if response.status_code == 200:
                             with open(person_image_path, 'wb') as f:
                                 for chunk in response.iter_content(chunk_size=8192):
                                     f.write(chunk)
                         else:
                             raise Exception(f"Failed to download person image: {response.status_code}")
-                        
                     except Exception as download_error:
-                        # Clean up on download failure
                         try:
                             shutil.rmtree(video_dir)
                         except:
@@ -295,10 +224,13 @@ def process_video_queue():
                     font_path = "assets/noto.ttf"
                     if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "h":
                         font_path = "assets/noto_hindi.ttf"
+                    
+                    display_name = data.get("person_name") or "Narrator"
+                    
                     create_overlay(
                         person_image_path=person_image_path,
                         volume_icon_path="assets/icon_volume.png",
-                        display_name=data["person_name"],
+                        display_name=display_name,
                         output_path=overlay_path,
                         subtitle_background_color=(0, 0, 0, 200),
                         font_path=font_path,
@@ -309,8 +241,7 @@ def process_video_queue():
                     segments = []
                     if LANGUAGE_VOICE_MAP[data["voice"]]["international"]:
                         captions, audio_length = create_tts_international(
-                            text=data["text"],
-                            output_path=sound_path,
+                            text=data["text"], output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                         )
@@ -318,123 +249,87 @@ def process_video_queue():
                         if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "z":
                             max_line_length = 15
                         segments = create_subtitle_segments_international(
-                            captions=captions,
-                            max_length=max_line_length,
-                            lines=2,
+                            captions=captions, max_length=max_line_length, lines=2,
                         )
                     else:
                         captions, audio_length = create_tts_english(
-                            text=data["text"],
-                            output_path=sound_path,
+                            text=data["text"], output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                         )
-                        
                         segments = create_subtitle_segments_english(
-                            captions=captions,
-                            max_length=30,
-                            lines=2
+                            captions=captions, max_length=30, lines=2
                         )
                     
-                    # Check version to decide subtitle style
                     version = data.get("version", "v1")
                     subtitle_path = os.path.join(video_dir, "subtitle.ass")
-                    
                     print(f"Creating subtitle (version: {version})")
                     
                     if version == "v2":
-                        # v2: Use word-by-word karaoke effect
-                        print("Using v2 karaoke subtitle style (word-by-word animation)")
+                        print("Using v2 karaoke subtitle style")
                         create_subtitle_v2_karaoke(
-                            word_captions=captions,  # Use raw captions (word-level)
-                            font_size=80,
-                            output_path=subtitle_path,
+                            word_captions=captions, font_size=80, output_path=subtitle_path,
                         )
                     else:
-                        # v1: Use traditional static subtitles
                         print("Using v1 static subtitle style")
                         create_subtitle(
-                            segments=segments,
-                            font_size=80,
-                            output_path=subtitle_path,
+                            segments=segments, font_size=80, output_path=subtitle_path,
                         )
+                    
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
                     render_video(
-                        sound_path=sound_path,
-                        subtitle_path=subtitle_path,
-                        overlay_path=overlay_path,
-                        audio_length=audio_length,
-                        bg_video_path=bg_video_path,
-                        output_path=video_path,
+                        sound_path=sound_path, subtitle_path=subtitle_path,
+                        overlay_path=overlay_path, audio_length=audio_length,
+                        bg_video_path=bg_video_path, output_path=video_path,
                     )
                     
-                    # Clean up temporary files
                     try:
                         print(f"Cleaning up temporary files for video: {video_id}")
                         shutil.rmtree(video_dir)
-                        print(f"Successfully removed temporary directory: {video_dir}")
                     except Exception as cleanup_error:
-                        print(f"Warning: Failed to clean up temporary files for {video_id}: {cleanup_error}")
+                        print(f"Warning: Failed to clean up: {cleanup_error}")
                     
                     videos[video_id]["status"] = VideoStatus.COMPLETED
-                    save_videos()  # Save state change
+                    save_videos()
                     print(f"Completed video: {video_id}")
                 
                 video_queue.task_done()
             else:
-                # Sleep briefly when the queue is empty
                 time.sleep(0.5)
         except Exception as e:
             print(f"Error in worker thread: {e}")
-            # If there was an error processing, mark as failed
             if 'video_id' in locals() and video_id in videos:
                 videos[video_id]["status"] = VideoStatus.FAILED
                 videos[video_id]["error"] = str(e)
-                save_videos()  # Save failure state
-                
-                # Clean up temporary files even on failure
+                save_videos()
                 try:
                     if 'video_dir' in locals():
-                        print(f"Cleaning up temporary files after error for video: {video_id}")
                         shutil.rmtree(video_dir)
-                except Exception as cleanup_error:
-                    print(f"Warning: Failed to clean up temporary files after error for {video_id}: {cleanup_error}")
+                except:
+                    pass
 
-# load videos at startup
 load_videos()
-
-# start worker thread
 worker_thread = threading.Thread(target=process_video_queue, daemon=True)
 
-### REST API endpoints ###
+### REST API ###
 @app.get("/health")
 def read_root():
     return {"status": "ok"}
 
-# get available languages (and their voices)
 @app.get("/api/languages")
 def get_languages():
     return LANGUAGE_VOICE_CONFIG
 
-# list all videos and their status
 @app.get("/api/videos")
 def list_videos():
-    return [{"video_id": video_id, "status": video_data["status"]} for video_id, video_data in videos.items()]
+    return [{"video_id": vid, "status": vd["status"]} for vid, vd in videos.items()]
 
-# create a new video
 @app.post("/api/videos")
 def create_video(video: dict):
-    # Get version parameter (v1 or v2)
-    # v1 = static subtitles (original)
-    # v2 = word-by-word karaoke effect
     version = video.get("version", "v1")
-    
-    # Get optional parameters with defaults
     voice = video.get("voice", "af_heart")
     overlay_bg_color = video.get("overlay_bg_color", (232, 14, 64))
-    
-    # bg_video_url is always required (n8n will provide it)
     bg_video_url = video.get("bg_video_url", "")
     if not bg_video_url:
         return {"error": "bg_video_url is required"}
@@ -454,57 +349,33 @@ def create_video(video: dict):
     if error:
         return {"error": error}
     
-    # Store video in the tracking dictionary
     videos[video_id] = video_data
-    save_videos()  # Save to persistent storage
-    
-    # Add to processing queue
+    save_videos()
     video_queue.put(video_id)
-    
     return {"video_id": video_id, "status": VideoStatus.QUEUED}
 
-# get video status
 @app.get("/api/videos/{video_id}/status")
 def get_video(video_id: str):
     if video_id in videos:
-        return {
-            "video_id": video_id, 
-            "status": videos[video_id]["status"]
-        }
-    else:
-        return {"video_id": video_id, "status": "not_found"}
+        return {"video_id": video_id, "status": videos[video_id]["status"]}
+    return {"video_id": video_id, "status": "not_found"}
 
-# download a video
 @app.get("/api/videos/{video_id}")
 def download_video(video_id: str, download: bool = False):
     if video_id in videos and videos[video_id]["status"] == VideoStatus.COMPLETED:
         video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
         if os.path.exists(video_path):
             return StreamingResponse(
-                iterfile(video_path),
-                media_type="video/mp4",
-                headers={
-                    "Content-Disposition": f'attachment; filename="{video_id}.mp4"'
-                }
+                iterfile(video_path), media_type="video/mp4",
+                headers={"Content-Disposition": f'attachment; filename="{video_id}.mp4"'}
             )
     elif video_id in videos:
         if videos[video_id]["status"] == VideoStatus.FAILED:
-            return JSONResponse(
-                content={"video_id": video_id, "status": VideoStatus.FAILED},
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return JSONResponse(content={"video_id": video_id, "status": VideoStatus.FAILED}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
         if videos[video_id]["status"] == VideoStatus.PROCESSING:
-            return JSONResponse(
-                content={"video_id": video_id, "status": VideoStatus.PROCESSING},
-                status_code=status.HTTP_202_ACCEPTED,
-            )
+            return JSONResponse(content={"video_id": video_id, "status": VideoStatus.PROCESSING}, status_code=status.HTTP_202_ACCEPTED)
+    return JSONResponse(content={"video_id": video_id, "status": VideoStatus.NOT_FOUND}, status_code=status.HTTP_404_NOT_FOUND)
 
-    return JSONResponse(
-        content={"video_id": video_id, "status": VideoStatus.NOT_FOUND},
-        status_code=status.HTTP_404_NOT_FOUND,
-    )
-
-# delete a video
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str):
     if video_id in videos:
@@ -514,202 +385,291 @@ def delete_video(video_id: str):
         del videos[video_id]
         save_videos()
         return {"video_id": video_id, "status": VideoStatus.DELETED}
-    else:
-        return {"video_id": video_id, "status": VideoStatus.NOT_FOUND}
+    return {"video_id": video_id, "status": VideoStatus.NOT_FOUND}
 
-# get queue status
 @app.get("/api/queue")
 def get_queue_status():
-    queue_size = video_queue.qsize()
-    queued_videos = [v for v in videos.values() if v["status"] == VideoStatus.QUEUED]
-    processing_videos = [v for v in videos.values() if v["status"] == VideoStatus.PROCESSING]
-    
     return {
-        "queue_size": queue_size,
-        "queued": len(queued_videos),
-        "processing": len(processing_videos)
+        "queue_size": video_queue.qsize(),
+        "queued": len([v for v in videos.values() if v["status"] == VideoStatus.QUEUED]),
+        "processing": len([v for v in videos.values() if v["status"] == VideoStatus.PROCESSING])
     }
 
-### todo add the MCP server ###
+### ImageFX (Google AI Image Generation) ###
+IMAGEFX_API_URL = "https://aisandbox-pa.googleapis.com/v1:runImageFx"
+IMAGEFX_IMAGES_DIR = os.path.join(os.getcwd(), "imagefx_output")
+os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 
-## tools
+ASPECT_RATIO_MAP = {
+    "LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "PORTRAIT": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    "SQUARE": "IMAGE_ASPECT_RATIO_SQUARE",
+}
+
+@app.post("/api/generate-image")
+def generate_imagefx(req: dict):
+    """Generate an image using Google ImageFX API.
+    
+    Body: { "cookie": "ya29...", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
+    Returns: { "image_url": "/api/imagefx/{image_id}", "image_id": "..." }
+    """
+    cookie = req.get("cookie", "").strip()
+    prompt = req.get("prompt", "").strip()
+    aspect_ratio = req.get("aspect_ratio", "LANDSCAPE").upper()
+    
+    if not cookie:
+        return JSONResponse(content={"error": "cookie (bearer token) is required"}, status_code=400)
+    if not prompt:
+        return JSONResponse(content={"error": "prompt is required"}, status_code=400)
+    
+    ar_value = ASPECT_RATIO_MAP.get(aspect_ratio, "IMAGE_ASPECT_RATIO_LANDSCAPE")
+    seed = random.randint(1, 2**31)
+    
+    payload = {
+        "userInput": {
+            "candidatesCount": 4,
+            "prompts": [prompt],
+            "seed": seed
+        },
+        "generationParams": {
+            "aspectRatio": ar_value
+        },
+        "clientContext": {
+            "tool": "IMAGE_FX"
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {cookie}",
+        "Content-Type": "application/json",
+        "Origin": "https://aisandbox.google.com",
+        "Referer": "https://aisandbox.google.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        resp = requests.post(IMAGEFX_API_URL, json=payload, headers=headers, timeout=60)
+        
+        if resp.status_code == 401 or resp.status_code == 403:
+            return JSONResponse(
+                content={"error": "Token expired or invalid", "status_code": resp.status_code},
+                status_code=resp.status_code
+            )
+        
+        if resp.status_code != 200:
+            return JSONResponse(
+                content={"error": f"ImageFX API error: {resp.status_code}", "detail": resp.text[:500]},
+                status_code=resp.status_code
+            )
+        
+        data = resp.json()
+        
+        # Extract images from response
+        images = []
+        image_panels = data.get("imagePanels", [])
+        for panel in image_panels:
+            generated = panel.get("generatedImages", [])
+            for img in generated:
+                encoded = img.get("encodedImage", "")
+                if encoded:
+                    images.append(encoded)
+        
+        if not images:
+            return JSONResponse(
+                content={"error": "No images returned from ImageFX", "raw_keys": list(data.keys())},
+                status_code=500
+            )
+        
+        # Save first image (best result) to disk
+        image_id = str(uuid.uuid4())[:12]
+        image_bytes = base64.b64decode(images[0])
+        image_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{image_id}.png")
+        with open(image_path, "wb") as f:
+            f.write(image_bytes)
+        
+        print(f"[ImageFX] Generated {len(images)} images, saved first as {image_id}.png ({len(image_bytes)} bytes)")
+        
+        return {
+            "image_id": image_id,
+            "image_url": f"/api/imagefx/{image_id}",
+            "total_generated": len(images),
+            "size_bytes": len(image_bytes)
+        }
+        
+    except requests.exceptions.Timeout:
+        return JSONResponse(content={"error": "ImageFX API timeout (60s)"}, status_code=504)
+    except Exception as e:
+        return JSONResponse(content={"error": f"ImageFX error: {str(e)}"}, status_code=500)
+
+
+@app.get("/api/imagefx/{image_id}")
+def get_imagefx_image(image_id: str):
+    """Serve a generated ImageFX image."""
+    image_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{image_id}.png")
+    if os.path.exists(image_path):
+        return FileResponse(image_path, media_type="image/png")
+    return JSONResponse(content={"error": "Image not found"}, status_code=404)
+
+
+@app.post("/api/test-imagefx")
+def test_imagefx_token(req: dict):
+    """Test if an ImageFX bearer token is valid.
+    
+    Body: { "cookie": "ya29..." }
+    Returns: { "valid": true/false, "message": "..." }
+    """
+    cookie = req.get("cookie", "").strip()
+    if not cookie:
+        return JSONResponse(content={"valid": False, "message": "Token vazio"}, status_code=400)
+    
+    # Use a minimal test prompt
+    seed = random.randint(1, 2**31)
+    payload = {
+        "userInput": {
+            "candidatesCount": 1,
+            "prompts": ["a simple red circle on white background"],
+            "seed": seed
+        },
+        "generationParams": {
+            "aspectRatio": "IMAGE_ASPECT_RATIO_SQUARE"
+        },
+        "clientContext": {
+            "tool": "IMAGE_FX"
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {cookie}",
+        "Content-Type": "application/json",
+        "Origin": "https://aisandbox.google.com",
+        "Referer": "https://aisandbox.google.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        resp = requests.post(IMAGEFX_API_URL, json=payload, headers=headers, timeout=30)
+        
+        if resp.status_code == 401 or resp.status_code == 403:
+            return {"valid": False, "message": f"Token inválido ou expirado (HTTP {resp.status_code})"}
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            has_images = any(
+                img.get("encodedImage")
+                for panel in data.get("imagePanels", [])
+                for img in panel.get("generatedImages", [])
+            )
+            if has_images:
+                return {"valid": True, "message": "Token válido — imagem gerada com sucesso"}
+            else:
+                return {"valid": True, "message": "Token aceito mas sem imagens retornadas"}
+        
+        return {"valid": False, "message": f"Erro inesperado: HTTP {resp.status_code}"}
+        
+    except requests.exceptions.Timeout:
+        return {"valid": False, "message": "Timeout ao testar (30s)"}
+    except Exception as e:
+        return {"valid": False, "message": f"Erro: {str(e)}"}
+
+
+### MCP Server ###
 @mcp.tool()
 def list_languages_mcp() -> dict:
-    """
-    List available languages and their voices.
-    """
+    """List available languages and their voices."""
     return LANGUAGE_VOICE_CONFIG
 
 @mcp.tool()
 def create_video_mcp(
     text: Annotated[str, Field(description="The text to be narrated in the video.")],
-    person_image_url: Annotated[str, Field(description="URL of the person's image to be used in the video.")],
-    person_name: Annotated[str, Field(description="Name of the person to be displayed in the video.")],
-    bg_video_url: Annotated[str, Field(description="URL of the background video to be used.")],
-    voice: Optional[AvailableVoices] = Field(description="Voice to be used for narration. Defaults to 'af_heart' if not provided.", default=None)) -> dict:
-    overlay_bg_color: Optional[tuple] = Field(description="Background color for overlay. Defaults to (232, 14, 64) if not provided.", default=(232, 14, 64))
-    """
-    Create a new narrated video with the provided content.
-    Args:
-        text: The text to be narrated in the video.
-        person_image_url: URL of the person's image to be used in the video.
-        person_name: Name of the person to be displayed in the video.
-        bg_video_url: URL of the background video to be used.
-        voice: Voice to be used for narration. Defaults to None.
-    Returns:
-        A dictionary containing the video_id and status of the created video
-    """
-
-    print(f"Creating video with text: {text}")
-    
-    # Set default values if not provided
+    person_image_url: Annotated[str, Field(description="URL of the person's image.")],
+    bg_video_url: Annotated[str, Field(description="URL of the background video.")],
+    person_name: Annotated[Optional[str], Field(description="Name displayed in video.")] = "Narrator",
+    voice: Annotated[Optional[str], Field(description="Voice for narration. Default: af_heart.")] = "af_heart",
+    overlay_bg_color: Annotated[Optional[tuple], Field(description="Overlay color (R,G,B).")] = (232, 14, 64),
+    version: Annotated[Optional[str], Field(description="'v1' static or 'v2' karaoke.")] = "v1"
+) -> dict:
+    """Create a new narrated video with the provided content."""
+    print(f"Creating video with text: {text[:100]}...")
     voice_str = voice if voice else "af_heart"
     bg_color = overlay_bg_color if overlay_bg_color else (232, 14, 64)
+    name = person_name if person_name else "Narrator"
+    ver = version if version else "v1"
     
     video_id, video_data, error = process_video_request(
-        text=text,
-        person_image_url=person_image_url,
-        person_name=person_name,
-        bg_video_url=bg_video_url,
-        voice=voice_str,
-        overlay_bg_color=bg_color
+        text=text, person_image_url=person_image_url, person_name=name,
+        bg_video_url=bg_video_url, voice=voice_str, overlay_bg_color=bg_color, version=ver
     )
-    
     if error:
         return {"error": error}
-    
-    # Store video in the tracking dictionary
     videos[video_id] = video_data
-    save_videos()  # Save to persistent storage
-    
-    # Add to processing queue
+    save_videos()
     video_queue.put(video_id)
-    
-    print(f"Creating video with text: {text}")
     return {"video_id": video_id, "status": VideoStatus.QUEUED.value}
 
-## mount the MCP server
 sse = SseServerTransport("/mcp/messages/")
 app.router.routes.append(Mount("/mcp/messages", app=sse.handle_post_message))
 
 @app.get("/mcp/sse", tags=["MCP"])
 async def handle_sse(request: Request):
-    """
-    SSE endpoint that connects to the MCP server
-
-    This endpoint establishes a Server-Sent Events connection with the client
-    and forwards communication to the Model Context Protocol server.
-    """
-    
     active_connections.add(request)
-    
-    async with sse.connect_sse(request.scope, request.receive, request._send) as (
-        read_stream,
-        write_stream,
-    ):
-        await mcp._mcp_server.run(
-            read_stream,
-            write_stream,
-            mcp._mcp_server.create_initialization_options(),
-        )
-    
+    async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+        await mcp._mcp_server.run(read_stream, write_stream, mcp._mcp_server.create_initialization_options())
     print("SSE connection closed")
-        
+
 def process_video_request(
-    text: str,
-    person_image_url: str,
-    person_name: str,
-    bg_video_url: str,
-    voice: str = "af_heart",
-    overlay_bg_color: tuple = (232, 14, 64),
-    version: str = "v1"
+    text: str, person_image_url: str, person_name: str, bg_video_url: str,
+    voice: str = "af_heart", overlay_bg_color: tuple = (232, 14, 64), version: str = "v1"
 ) -> tuple[str, dict, str]:
-    """
-    Process video creation request by validating inputs and checking resource availability.
-    
-    Args:
-        text: The text to be narrated in the video
-        person_image_url: URL of the person's image to use
-        person_name: Name of the person to display
-        bg_video_url: URL of the background video
-        voice: Voice ID to use for narration (default: af_heart)
-        overlay_bg_color: Background color for overlay (default: (232, 14, 64))
-        version: Version of the API (v1 or v2, default: v1)
-        
-    Returns:
-        tuple containing:
-        - video_id: Unique ID for the video
-        - video_data: Dictionary with video configuration
-        - error: Error message if any, empty string if successful
-    """
-    # Validate required fields
-    required_fields = ["text", "person_image_url", "person_name", "bg_video_url"]
-    for field_name, field_value in [
-        ("text", text),
-        ("person_image_url", person_image_url),
-        ("person_name", person_name),
-        ("bg_video_url", bg_video_url)
-    ]:
-        if not field_value:
-            return None, None, f"Missing required field: {field_name}"
-    
-    # Validate URLs and check if resources exist
+    """Process video creation request."""
+    if not text:
+        return None, None, "Missing required field: text"
+    if not person_image_url:
+        return None, None, "Missing required field: person_image_url"
+    if not bg_video_url:
+        return None, None, "Missing required field: bg_video_url"
+    if not person_name:
+        person_name = "Narrator"
     if not bg_video_url.startswith("http"):
         return None, None, "Invalid bg_video_url: should start with http"
-    
     if not person_image_url.startswith("http"):
         return None, None, "Invalid person_image_url: should start with http"
     
-    # Check if background video exists and validate extension
+    # Check background video
     try:
         response = requests.head(bg_video_url, timeout=10, allow_redirects=True)
-        
-        # Google Drive pode retornar 303 (See Other) ou 302 (Found) para redirects
-        # Ambos são válidos e indicam que o arquivo existe
         if response.status_code not in [200, 302, 303]:
             return None, None, f"Background video not accessible: {response.status_code}"
-        
-        # Validate extension for standard URLs
-        # Google Drive URLs don't have extensions in the URL, so we skip validation for them
-        if "drive.google.com" not in bg_video_url:
-            extension = os.path.splitext(bg_video_url)[1].lower()
-            if extension not in [".mp4", ".mov", ".avi"]:
-                return None, None, "Invalid bg_video_url: should be a video file (.mp4, .mov, .avi)"
+        if not any(d in bg_video_url for d in ["drive.google.com", "googleapis.com", "supabase.co"]):
+            ext = os.path.splitext(bg_video_url)[1].lower().split('?')[0]
+            if ext and ext not in [".mp4", ".mov", ".avi", ".webm"]:
+                return None, None, "Invalid bg_video_url: should be a video file"
     except Exception as e:
         return None, None, f"Error checking bg_video_url: {str(e)}"
 
-    # Check if person image exists and validate extension
+    # Check person image
     try:
-        response = requests.head(person_image_url, timeout=10)
-        if response.status_code != 200:
+        response = requests.head(person_image_url, timeout=10, allow_redirects=True)
+        if response.status_code not in [200, 302, 303]:
             return None, None, f"Person image not accessible: {response.status_code}"
-        
-        extension = os.path.splitext(person_image_url)[1].lower()
-        if extension not in [".jpg", ".jpeg", ".png"]:
-            return None, None, "Invalid person_image_url: should be an image file (.jpg, .jpeg, .png)"
+        if not any(d in person_image_url for d in ["drive.google.com", "googleapis.com", "supabase.co", "cloudflare"]):
+            ext = os.path.splitext(person_image_url)[1].lower().split('?')[0]
+            if ext and ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+                return None, None, "Invalid person_image_url: should be an image file"
     except Exception as e:
         return None, None, f"Error checking person_image_url: {str(e)}"
     
-    # Validate voice
     if voice not in LANGUAGE_VOICE_MAP:
-        return None, None, f"Invalid voice: {voice}"
+        return None, None, f"Invalid voice: {voice}. Available: {list(LANGUAGE_VOICE_MAP.keys())}"
     
     video_id = str(uuid.uuid4())
-            
-    # Create video data structure (no downloading yet)
     video_data = {
         "id": video_id,
         "status": VideoStatus.QUEUED,
         "data": {
-            "text": text,
-            "person_name": person_name,
-            "voice": voice,
-            "overlay_bg_color": overlay_bg_color,
-            "person_image_url": person_image_url,
-            "bg_video_url": bg_video_url,
-            "version": version,
+            "text": text, "person_name": person_name, "voice": voice,
+            "overlay_bg_color": overlay_bg_color, "person_image_url": person_image_url,
+            "bg_video_url": bg_video_url, "version": version,
         },
         "created_at": time.time()
     }
-    
     return video_id, video_data, ""
