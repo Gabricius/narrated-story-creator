@@ -407,86 +407,98 @@ def get_queue_status():
     }
 
 ### ImageFX (Google AI Image Generation) ###
+# Based on: https://github.com/rohitaryal/imageFX-api
+# Auth flow: cookie → labs.google/fx/api/auth/session → access_token → aisandbox API
 IMAGEFX_API_URL = "https://aisandbox-pa.googleapis.com/v1:runImageFx"
+IMAGEFX_SESSION_URL = "https://labs.google/fx/api/auth/session"
 IMAGEFX_IMAGES_DIR = os.path.join(os.getcwd(), "imagefx_output")
 os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
+
+IMAGEFX_DEFAULT_HEADERS = {
+    "Origin": "https://labs.google",
+    "Content-Type": "application/json",
+    "Referer": "https://labs.google/fx/tools/image-fx",
+}
 
 ASPECT_RATIO_MAP = {
     "LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
     "PORTRAIT": "IMAGE_ASPECT_RATIO_PORTRAIT",
     "SQUARE": "IMAGE_ASPECT_RATIO_SQUARE",
+    "LANDSCAPE_4_3": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
 }
 
-def extract_bearer_token(raw: str) -> str:
-    """Extract a ya29.* bearer token from various input formats.
+
+def imagefx_get_token(cookie: str) -> dict:
+    """Exchange session cookie for access token via labs.google.
     
-    Accepts:
-    - Raw bearer token: "ya29.a0ABC..."
-    - Cookie header string containing the token somewhere
-    - "Bearer ya29.a0ABC..."
-    
-    Returns the clean token or None if not found.
+    Returns: { "access_token": "ya29...", "expires": "...", "user": {...} }
+    Raises: Exception on failure
     """
-    raw = raw.strip()
-    # Remove "Bearer " prefix if present
-    if raw.lower().startswith("bearer "):
-        raw = raw[7:].strip()
-    # If it starts with ya29, it's already the token
-    if raw.startswith("ya29."):
-        return raw
-    # Try to find ya29 token inside a cookie string or other text
-    import re
-    match = re.search(r'(ya29\.[A-Za-z0-9_\-\.]+)', raw)
-    if match:
-        return match.group(1)
-    return None
+    headers = {**IMAGEFX_DEFAULT_HEADERS, "Cookie": cookie}
+    resp = requests.get(IMAGEFX_SESSION_URL, headers=headers, timeout=15)
+    
+    if not resp.ok:
+        raise Exception(f"Session auth failed (HTTP {resp.status_code}): {resp.text[:300]}")
+    
+    data = resp.json()
+    if not data.get("access_token") or not data.get("expires"):
+        raise Exception(f"Session response missing access_token/expires. Keys: {list(data.keys())}")
+    
+    return data
+
 
 @app.post("/api/generate-image")
 def generate_imagefx(req: dict):
     """Generate an image using Google ImageFX API.
     
-    Body: { "cookie": "ya29...", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
-    The "cookie" field accepts a Bearer token (ya29.*) or a cookie string containing one.
+    Body: { "cookie": "<session cookie header string>", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
+    The "cookie" field should be the full cookie header string from labs.google (via Cookie Editor → Export → Header String).
     """
-    raw_token = req.get("cookie", "").strip()
+    cookie = req.get("cookie", "").strip()
     prompt = req.get("prompt", "").strip()
     aspect_ratio = req.get("aspect_ratio", "LANDSCAPE").upper()
+    num_images = req.get("num_images", 4)
+    seed = req.get("seed", random.randint(1, 2**31))
     
-    if not raw_token:
-        return JSONResponse(content={"error": "Bearer token is required (field: cookie)"}, status_code=400)
+    if not cookie:
+        return JSONResponse(content={"error": "Cookie de sessão é obrigatório"}, status_code=400)
     if not prompt:
-        return JSONResponse(content={"error": "prompt is required"}, status_code=400)
-    
-    token = extract_bearer_token(raw_token)
-    if not token:
-        return JSONResponse(
-            content={"error": "Token inválido. Cole o Bearer Token que começa com ya29."},
-            status_code=400
-        )
+        return JSONResponse(content={"error": "Prompt é obrigatório"}, status_code=400)
     
     ar_value = ASPECT_RATIO_MAP.get(aspect_ratio, "IMAGE_ASPECT_RATIO_LANDSCAPE")
-    seed = random.randint(1, 2**31)
     
+    # Step 1: Exchange cookie for access token
+    try:
+        session_data = imagefx_get_token(cookie)
+        access_token = session_data["access_token"]
+        print(f"[ImageFX] Got access token: {access_token[:20]}...")
+    except Exception as e:
+        return JSONResponse(
+            content={"error": f"Falha na autenticação: {str(e)}"},
+            status_code=401
+        )
+    
+    # Step 2: Generate image
     payload = {
         "userInput": {
-            "candidatesCount": 4,
+            "candidatesCount": num_images,
             "prompts": [prompt],
             "seed": seed
         },
-        "generationParams": {
-            "aspectRatio": ar_value
-        },
         "clientContext": {
+            "sessionId": f";{int(time.time() * 1000)}",
             "tool": "IMAGE_FX"
-        }
+        },
+        "modelInput": {
+            "modelNameType": "IMAGEN_3_5"
+        },
+        "aspectRatio": ar_value
     }
     
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Origin": "https://aisandbox.google.com",
-        "Referer": "https://aisandbox.google.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        **IMAGEFX_DEFAULT_HEADERS,
+        "Cookie": cookie,
+        "Authorization": f"Bearer {access_token}",
     }
     
     try:
@@ -494,13 +506,13 @@ def generate_imagefx(req: dict):
         
         if resp.status_code == 401 or resp.status_code == 403:
             return JSONResponse(
-                content={"error": "Token expired or invalid", "status_code": resp.status_code},
+                content={"error": f"Token expirado ou inválido (HTTP {resp.status_code})"},
                 status_code=resp.status_code
             )
         
         if resp.status_code != 200:
             return JSONResponse(
-                content={"error": f"ImageFX API error: {resp.status_code}", "detail": resp.text[:500]},
+                content={"error": f"ImageFX API error: HTTP {resp.status_code}", "detail": resp.text[:500]},
                 status_code=resp.status_code
             )
         
@@ -518,11 +530,11 @@ def generate_imagefx(req: dict):
         
         if not images:
             return JSONResponse(
-                content={"error": "No images returned from ImageFX", "raw_keys": list(data.keys())},
+                content={"error": "Nenhuma imagem retornada pelo ImageFX", "raw_keys": list(data.keys())},
                 status_code=500
             )
         
-        # Save first image (best result) to disk
+        # Save first image to disk
         image_id = str(uuid.uuid4())[:12]
         image_bytes = base64.b64decode(images[0])
         image_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{image_id}.png")
@@ -555,20 +567,26 @@ def get_imagefx_image(image_id: str):
 
 @app.post("/api/test-imagefx")
 def test_imagefx_token(req: dict):
-    """Test if an ImageFX bearer token is valid.
+    """Test if an ImageFX session cookie is valid.
     
-    Body: { "cookie": "ya29..." }
-    Returns: { "valid": true/false, "message": "..." }
+    Body: { "cookie": "<session cookie header string>" }
+    Returns: { "valid": true/false, "message": "...", "user": "..." }
     """
-    raw_token = req.get("cookie", "").strip()
-    if not raw_token:
-        return JSONResponse(content={"valid": False, "message": "Token vazio"}, status_code=400)
+    cookie = req.get("cookie", "").strip()
+    if not cookie:
+        return JSONResponse(content={"valid": False, "message": "Cookie vazio"}, status_code=400)
     
-    token = extract_bearer_token(raw_token)
-    if not token:
-        return {"valid": False, "message": "Token inválido. Use o Bearer Token (começa com ya29.), não o cookie de sessão."}
+    # Step 1: Try to get an access token from the cookie
+    try:
+        session_data = imagefx_get_token(cookie)
+        access_token = session_data["access_token"]
+        user_name = session_data.get("user", {}).get("name", "Unknown")
+        user_email = session_data.get("user", {}).get("email", "")
+        expires = session_data.get("expires", "")
+    except Exception as e:
+        return {"valid": False, "message": f"Autenticação falhou: {str(e)}"}
     
-    # Use a minimal test prompt
+    # Step 2: Test a minimal image generation
     seed = random.randint(1, 2**31)
     payload = {
         "userInput": {
@@ -576,27 +594,27 @@ def test_imagefx_token(req: dict):
             "prompts": ["a simple red circle on white background"],
             "seed": seed
         },
-        "generationParams": {
-            "aspectRatio": "IMAGE_ASPECT_RATIO_SQUARE"
-        },
         "clientContext": {
+            "sessionId": f";{int(time.time() * 1000)}",
             "tool": "IMAGE_FX"
-        }
+        },
+        "modelInput": {
+            "modelNameType": "IMAGEN_3_5"
+        },
+        "aspectRatio": "IMAGE_ASPECT_RATIO_SQUARE"
     }
     
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Origin": "https://aisandbox.google.com",
-        "Referer": "https://aisandbox.google.com/",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        **IMAGEFX_DEFAULT_HEADERS,
+        "Cookie": cookie,
+        "Authorization": f"Bearer {access_token}",
     }
     
     try:
         resp = requests.post(IMAGEFX_API_URL, json=payload, headers=headers, timeout=30)
         
         if resp.status_code == 401 or resp.status_code == 403:
-            return {"valid": False, "message": f"Token inválido ou expirado (HTTP {resp.status_code})"}
+            return {"valid": False, "message": f"Token aceito mas API rejeitou (HTTP {resp.status_code})"}
         
         if resp.status_code == 200:
             data = resp.json()
@@ -606,14 +624,20 @@ def test_imagefx_token(req: dict):
                 for img in panel.get("generatedImages", [])
             )
             if has_images:
-                return {"valid": True, "message": "Token válido — imagem gerada com sucesso"}
+                return {
+                    "valid": True,
+                    "message": f"Cookie válido — imagem gerada com sucesso (user: {user_name})",
+                    "user": user_name,
+                    "email": user_email,
+                    "expires": expires
+                }
             else:
-                return {"valid": True, "message": "Token aceito mas sem imagens retornadas"}
+                return {"valid": True, "message": f"Cookie aceito mas sem imagens retornadas (user: {user_name})"}
         
-        return {"valid": False, "message": f"Erro inesperado: HTTP {resp.status_code}"}
+        return {"valid": False, "message": f"Erro inesperado: HTTP {resp.status_code}", "detail": resp.text[:300]}
         
     except requests.exceptions.Timeout:
-        return {"valid": False, "message": "Timeout ao testar (30s)"}
+        return {"valid": False, "message": "Timeout ao testar (30s) — mas autenticação OK"}
     except Exception as e:
         return {"valid": False, "message": f"Erro: {str(e)}"}
 
