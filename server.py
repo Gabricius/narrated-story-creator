@@ -436,6 +436,38 @@ IMAGEFX_SESSION_URL = "https://labs.google/fx/api/auth/session"
 IMAGEFX_IMAGES_DIR = os.path.join(os.getcwd(), "imagefx_output")
 os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 
+# Supabase Storage for persistent image storage
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+IMAGEFX_BUCKET = "imagefx"
+
+
+def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
+    """Upload image to Supabase Storage bucket. Returns public URL or None on failure."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("[ImageFX] Supabase Storage not configured, skipping upload")
+        return None
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/storage/v1/object/{IMAGEFX_BUCKET}/{filename}",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "image/png",
+                "x-upsert": "true"
+            },
+            data=image_bytes,
+            timeout=30
+        )
+        if resp.status_code in (200, 201):
+            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{IMAGEFX_BUCKET}/{filename}"
+            return public_url
+        else:
+            print(f"[ImageFX] Supabase upload failed: {resp.status_code} {resp.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"[ImageFX] Supabase upload error: {e}")
+        return None
+
 IMAGEFX_DEFAULT_HEADERS = {
     "Origin": "https://labs.google",
     "Content-Type": "application/json",
@@ -478,7 +510,7 @@ def generate_imagefx(req: dict):
     """
     cookie = req.get("cookie", "").strip()
     prompt = req.get("prompt", "").strip()
-    aspect_ratio = req.get("aspect_ratio", "LANDSCAPE").upper()
+    aspect_ratio = req.get("aspect_ratio", "PORTRAIT").upper()
     num_images = req.get("num_images", 4)
     seed = req.get("seed", random.randint(1, 2**31))
     
@@ -556,24 +588,31 @@ def generate_imagefx(req: dict):
                 status_code=500
             )
         
-        # Save ALL images to disk
+        # Save ALL images (Supabase Storage for persistence + local cache)
         base_id = str(uuid.uuid4())[:12]
         saved_images = []
         
         for idx, encoded in enumerate(images):
             img_id = f"{base_id}_{idx}"
             img_bytes = base64.b64decode(encoded)
+            
+            # Local cache
             img_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{img_id}.png")
             with open(img_path, "wb") as f:
                 f.write(img_bytes)
+            
+            # Upload to Supabase Storage (persistent)
+            public_url = upload_to_supabase_storage(img_bytes, f"{img_id}.png")
+            
             saved_images.append({
                 "image_id": img_id,
-                "image_url": f"/api/imagefx/{img_id}",
+                "image_url": public_url or f"/api/imagefx/{img_id}",
                 "size_bytes": len(img_bytes)
             })
         
         primary = saved_images[0]
-        print(f"[ImageFX] Generated {len(images)} images, saved all as {base_id}_*.png")
+        storage_type = "supabase" if saved_images[0]["image_url"].startswith("http") else "local"
+        print(f"[ImageFX] Generated {len(images)} images, saved as {base_id}_* ({storage_type})")
         
         return {
             "success": True,
