@@ -556,20 +556,32 @@ def generate_imagefx(req: dict):
                 status_code=500
             )
         
-        # Save first image to disk
-        image_id = str(uuid.uuid4())[:12]
-        image_bytes = base64.b64decode(images[0])
-        image_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{image_id}.png")
-        with open(image_path, "wb") as f:
-            f.write(image_bytes)
+        # Save ALL images to disk
+        base_id = str(uuid.uuid4())[:12]
+        saved_images = []
         
-        print(f"[ImageFX] Generated {len(images)} images, saved first as {image_id}.png ({len(image_bytes)} bytes)")
+        for idx, encoded in enumerate(images):
+            img_id = f"{base_id}_{idx}"
+            img_bytes = base64.b64decode(encoded)
+            img_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{img_id}.png")
+            with open(img_path, "wb") as f:
+                f.write(img_bytes)
+            saved_images.append({
+                "image_id": img_id,
+                "image_url": f"/api/imagefx/{img_id}",
+                "size_bytes": len(img_bytes)
+            })
+        
+        primary = saved_images[0]
+        print(f"[ImageFX] Generated {len(images)} images, saved all as {base_id}_*.png")
         
         return {
-            "image_id": image_id,
-            "image_url": f"/api/imagefx/{image_id}",
-            "total_generated": len(images),
-            "size_bytes": len(image_bytes)
+            "success": True,
+            "image_id": primary["image_id"],
+            "image_url": primary["image_url"],
+            "total_generated": len(saved_images),
+            "size_bytes": primary["size_bytes"],
+            "all_images": [img["image_url"] for img in saved_images]
         }
         
     except requests.exceptions.Timeout:
