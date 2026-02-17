@@ -360,6 +360,8 @@ def list_videos():
 
 @app.post("/api/videos")
 def create_video(video: dict):
+    text_len = len(video.get("text", ""))
+    print(f"[API] POST /api/videos received — text: {text_len} chars, version: {video.get('version', '?')}")
     version = video.get("version", "v1")
     voice = video.get("voice", "af_heart")
     overlay_bg_color = video.get("overlay_bg_color", (232, 14, 64))
