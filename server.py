@@ -158,20 +158,34 @@ captions, audio_length = {tts_func}(
     lang_code="{lang_code}", voice="{voice}",
 )
 
-# Serialize captions to JSON
+# Serialize captions to JSON — handle ANY caption format
 serializable = []
 for cap in captions:
     if isinstance(cap, dict):
         serializable.append(cap)
     elif isinstance(cap, (list, tuple)):
         serializable.append(list(cap))
+    elif hasattr(cap, '__dict__'):
+        # Custom object (WordCaption, etc.) — convert to dict
+        serializable.append(cap.__dict__)
+    elif hasattr(cap, '_asdict'):
+        # namedtuple — convert to dict
+        serializable.append(cap._asdict())
+    elif hasattr(cap, 'start') and hasattr(cap, 'end'):
+        # Duck-type: anything with start/end/word
+        d = {{"start": cap.start, "end": cap.end}}
+        if hasattr(cap, 'word'): d["word"] = cap.word
+        if hasattr(cap, 'text'): d["text"] = cap.text
+        serializable.append(d)
     else:
-        serializable.append(str(cap))
+        # Last resort — try to convert, log warning
+        print(f"WARNING: Unknown caption type: {{type(cap).__name__}} — {{repr(cap)[:100]}}")
+        serializable.append({{"text": str(cap), "start": 0, "end": 0}})
 
 with open("{chunk_captions_path}", "w") as f:
     json.dump({{"captions": serializable, "audio_length": audio_length}}, f)
 
-print(f"CHUNK_OK audio_length={{audio_length:.2f}}")
+print(f"CHUNK_OK audio_length={{audio_length:.2f}} captions={{len(serializable)}}")
 '''
         
         worker_script_path = os.path.join(video_dir, f'chunk_{i}_worker.py')
@@ -297,9 +311,94 @@ VIDEOS_DIR = os.path.join(WORK_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 SHELVE_FILE_PATH = os.path.join(WORK_DIR, "videos_db")
 
-## Video storage note:
-## Videos are stored locally temporarily. Job 5 (n8n) handles upload to Google Drive
-## and calls DELETE /api/videos/{id} to clean up local files after upload.
+## Video storage — rclone uploads to Google Drive from VPS
+## After rendering, rclone copies the video to Drive and returns a public URL
+## Job 5 (n8n) only needs to read the drive_url from status, no file transfer needed
+
+RCLONE_REMOTE = os.environ.get("RCLONE_REMOTE", "gdrive")
+RCLONE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
+
+def rclone_upload_video(local_path, filename, folder_id=None):
+    """Upload video to Google Drive via rclone. Returns public URL or None."""
+    target_folder = folder_id or RCLONE_FOLDER_ID
+    if not target_folder:
+        print("[RCLONE] No GDRIVE_FOLDER_ID configured, skipping upload")
+        return None
+    
+    try:
+        import subprocess as sp
+        file_size = os.path.getsize(local_path) / 1024 / 1024
+        print(f"[RCLONE] Uploading {filename} ({file_size:.1f} MB) to folder {target_folder}...")
+        
+        # Step 1: Copy file to Google Drive
+        result = sp.run([
+            "rclone", "copy",
+            local_path,
+            f"{RCLONE_REMOTE}:",
+            "--drive-root-folder-id", target_folder,
+            "--drive-acknowledge-abuse",
+            "--progress",
+            "--stats-one-line",
+        ], capture_output=True, text=True, timeout=1800)  # 30 min max
+        
+        if result.returncode != 0:
+            print(f"[RCLONE] Upload failed: {result.stderr[-300:]}")
+            return None
+        
+        print(f"[RCLONE] Upload complete, getting public link...")
+        
+        # Step 2: Get public link
+        link_result = sp.run([
+            "rclone", "link",
+            f"{RCLONE_REMOTE}:{filename}",
+            "--drive-root-folder-id", target_folder,
+        ], capture_output=True, text=True, timeout=30)
+        
+        if link_result.returncode == 0 and link_result.stdout.strip():
+            public_url = link_result.stdout.strip()
+            print(f"[RCLONE] Public URL: {public_url}")
+            return public_url
+        else:
+            # Fallback: list files to find the ID
+            list_result = sp.run([
+                "rclone", "lsjson",
+                f"{RCLONE_REMOTE}:",
+                "--drive-root-folder-id", target_folder,
+                "--no-modtime",
+                "-f", f"+ {filename}",
+                "-f", "- *",
+            ], capture_output=True, text=True, timeout=30)
+            
+            if list_result.returncode == 0:
+                import json as _json
+                files = _json.loads(list_result.stdout)
+                if files:
+                    file_id = files[0].get("ID", "")
+                    if file_id:
+                        url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                        print(f"[RCLONE] Constructed URL: {url}")
+                        return url
+            
+            print(f"[RCLONE] Could not get link: {link_result.stderr[:200]}")
+            return None
+    
+    except Exception as e:
+        print(f"[RCLONE] Error: {e}")
+        return None
+
+def rclone_available():
+    """Check if rclone is installed and configured."""
+    try:
+        import subprocess as sp
+        result = sp.run(["rclone", "version"], capture_output=True, timeout=5)
+        return result.returncode == 0
+    except:
+        return False
+
+if rclone_available():
+    print(f"[RCLONE] Available — remote: {RCLONE_REMOTE}, folder: {RCLONE_FOLDER_ID or '(not set)'}")
+else:
+    print("[RCLONE] Not installed — videos will stay local")
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
@@ -539,6 +638,43 @@ def process_video_queue():
                             segments=segments, font_size=80, output_path=subtitle_path,
                         )
                     
+                    # Pre-process background video for smooth looping
+                    bg_duration = None
+                    try:
+                        import subprocess as sp_probe
+                        probe = sp_probe.run([
+                            "ffprobe", "-v", "error",
+                            "-show_entries", "format=duration",
+                            "-of", "csv=p=0", bg_video_path
+                        ], capture_output=True, text=True, timeout=10)
+                        if probe.returncode == 0:
+                            bg_duration = float(probe.stdout.strip())
+                    except:
+                        pass
+                    
+                    # If bg video is shorter than audio, create palindrome (fwd+rev) for smooth loop
+                    if bg_duration and audio_length > bg_duration:
+                        print(f"[BG] Video ({bg_duration:.0f}s) shorter than audio ({audio_length:.0f}s) — creating smooth palindrome loop")
+                        palindrome_path = os.path.join(video_dir, "bg_palindrome.mp4")
+                        import subprocess as sp_ffmpeg
+                        # Create forward + reverse concatenation for seamless looping
+                        palindrome_result = sp_ffmpeg.run([
+                            "ffmpeg", "-y",
+                            "-i", bg_video_path,
+                            "-filter_complex",
+                            "[0:v]split[fwd][rev];[rev]reverse[reversed];[fwd][reversed]concat=n=2:v=1:a=0[out]",
+                            "-map", "[out]",
+                            "-an",
+                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                            palindrome_path
+                        ], capture_output=True, text=True, timeout=300)
+                        
+                        if palindrome_result.returncode == 0 and os.path.exists(palindrome_path):
+                            bg_video_path = palindrome_path
+                            print(f"[BG] Palindrome created: {os.path.getsize(palindrome_path) / 1024 / 1024:.1f} MB")
+                        else:
+                            print(f"[BG] Palindrome failed, using original: {palindrome_result.stderr[-200:]}")
+                    
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
                     render_video(
@@ -553,11 +689,23 @@ def process_video_queue():
                     except Exception as cleanup_error:
                         print(f"Warning: Failed to clean up: {cleanup_error}")
                     
+                    # Upload to Google Drive via rclone if available
+                    drive_url = None
+                    if rclone_available() and RCLONE_FOLDER_ID:
+                        drive_url = rclone_upload_video(video_path, f"{video_id}.mp4")
+                        if drive_url:
+                            videos[video_id]["drive_url"] = drive_url
+                            # Delete local file to save disk
+                            try:
+                                os.remove(video_path)
+                                print(f"[DISK] Deleted local: {video_path}")
+                            except:
+                                pass
+                    
                     videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
                     gc.collect()
-                    video_size = os.path.getsize(video_path) / 1024 / 1024
-                    print(f"Completed video: {video_id} ({video_size:.1f} MB) — waiting for n8n to pick up")
+                    print(f"Completed video: {video_id} | Storage: {('Drive: ' + drive_url) if drive_url else 'local'}")
                 
                 video_queue.task_done()
             else:
@@ -626,19 +774,31 @@ def get_video(video_id: str):
     if video_id in videos:
         result = {"video_id": video_id, "status": videos[video_id]["status"]}
         if videos[video_id]["status"] == VideoStatus.COMPLETED:
-            video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
-            if os.path.exists(video_path):
-                result["video_url"] = f"/api/videos/{video_id}"
-                result["size_mb"] = round(os.path.getsize(video_path) / 1024 / 1024, 1)
+            drive_url = videos[video_id].get("drive_url")
+            if drive_url:
+                result["video_url"] = drive_url
+                result["storage"] = "drive"
             else:
-                result["video_url"] = None
-                result["note"] = "File already cleaned up"
+                video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+                if os.path.exists(video_path):
+                    result["video_url"] = f"/api/videos/{video_id}"
+                    result["size_mb"] = round(os.path.getsize(video_path) / 1024 / 1024, 1)
+                    result["storage"] = "local"
+                else:
+                    result["video_url"] = None
+                    result["note"] = "File already cleaned up"
         return result
     return {"video_id": video_id, "status": "not_found"}
 
 @app.get("/api/videos/{video_id}")
 def download_video(video_id: str, download: bool = False):
     if video_id in videos and videos[video_id]["status"] == VideoStatus.COMPLETED:
+        # If on Google Drive, redirect
+        drive_url = videos[video_id].get("drive_url")
+        if drive_url:
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url=drive_url)
+        # Otherwise serve local file
         video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
         if os.path.exists(video_path):
             return StreamingResponse(
@@ -673,15 +833,23 @@ def disk_status():
     """Show disk usage for video storage."""
     entries = []
     total_size = 0
+    drive_count = 0
     for vid, data in videos.items():
         path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
         exists = os.path.exists(path)
         size = os.path.getsize(path) if exists else 0
-        entries.append({"video_id": vid, "status": data["status"], "local": exists, "size_mb": round(size / 1024 / 1024, 1)})
+        entry = {"video_id": vid, "status": data["status"], "local": exists, "size_mb": round(size / 1024 / 1024, 1)}
+        if data.get("drive_url"):
+            entry["drive_url"] = data["drive_url"]
+            drive_count += 1
+        entries.append(entry)
         total_size += size
     return {
         "total_videos": len(entries),
+        "on_drive": drive_count,
+        "local_only": len(entries) - drive_count,
         "total_local_mb": round(total_size / 1024 / 1024, 1),
+        "rclone_available": rclone_available(),
         "videos": entries
     }
 
