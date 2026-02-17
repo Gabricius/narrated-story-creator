@@ -54,6 +54,126 @@ from video_maker import (
     render_video,
 )
 import shutil
+import gc
+import wave
+
+# ═══════════════════════════════
+# CHUNKED TTS — Process large texts in pieces to avoid OOM
+# ═══════════════════════════════
+
+TTS_CHUNK_CHARS = 3000  # Max chars per TTS chunk (~3 min audio each)
+
+def split_text_into_chunks(text, max_chars=TTS_CHUNK_CHARS):
+    """Split text into chunks at sentence boundaries."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) + 1 > max_chars and current:
+            chunks.append(current.strip())
+            current = s
+        else:
+            current = current + " " + s if current else s
+    if current.strip():
+        chunks.append(current.strip())
+    return chunks if chunks else [text]
+
+def concatenate_wav_files(wav_paths, output_path):
+    """Concatenate multiple WAV files into one."""
+    if len(wav_paths) == 1:
+        os.rename(wav_paths[0], output_path)
+        return
+    
+    params = None
+    frames = []
+    for p in wav_paths:
+        with wave.open(p, 'rb') as w:
+            if params is None:
+                params = w.getparams()
+            frames.append(w.readframes(w.getnframes()))
+    
+    with wave.open(output_path, 'wb') as out:
+        out.setparams(params)
+        for f in frames:
+            out.writeframes(f)
+    
+    # Cleanup chunk files
+    for p in wav_paths:
+        try:
+            os.remove(p)
+        except:
+            pass
+
+def create_tts_chunked(text, output_path, lang_code, voice, is_international=False):
+    """Process TTS in chunks to avoid OOM on large texts."""
+    chunks = split_text_into_chunks(text)
+    total_chunks = len(chunks)
+    print(f"[TTS] Processing {len(text)} chars in {total_chunks} chunks")
+    
+    all_captions = []
+    chunk_wav_paths = []
+    cumulative_duration = 0.0
+    
+    for i, chunk_text in enumerate(chunks):
+        chunk_path = output_path.replace('.wav', f'_chunk{i}.wav')
+        print(f"[TTS] Chunk {i+1}/{total_chunks}: {len(chunk_text)} chars")
+        
+        try:
+            if is_international:
+                captions, audio_length = create_tts_international(
+                    text=chunk_text, output_path=chunk_path,
+                    lang_code=lang_code, voice=voice,
+                )
+            else:
+                captions, audio_length = create_tts_english(
+                    text=chunk_text, output_path=chunk_path,
+                    lang_code=lang_code, voice=voice,
+                )
+            
+            # Adjust caption timestamps by cumulative offset
+            adjusted_captions = []
+            for cap in captions:
+                if isinstance(cap, dict):
+                    adj = dict(cap)
+                    if 'start' in adj:
+                        adj['start'] += cumulative_duration
+                    if 'end' in adj:
+                        adj['end'] += cumulative_duration
+                    adjusted_captions.append(adj)
+                elif isinstance(cap, (list, tuple)) and len(cap) >= 3:
+                    # (start, end, text, ...) format
+                    cap_list = list(cap)
+                    cap_list[0] += cumulative_duration
+                    cap_list[1] += cumulative_duration
+                    adjusted_captions.append(tuple(cap_list) if isinstance(cap, tuple) else cap_list)
+                else:
+                    adjusted_captions.append(cap)
+            
+            all_captions.extend(adjusted_captions)
+            chunk_wav_paths.append(chunk_path)
+            cumulative_duration += audio_length
+            
+            print(f"[TTS] Chunk {i+1} done: {audio_length:.1f}s (total: {cumulative_duration:.1f}s)")
+            
+            # Force garbage collection between chunks
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"[TTS] Chunk {i+1} failed: {e}")
+            # Clean up any chunk files
+            for p in chunk_wav_paths:
+                try: os.remove(p)
+                except: pass
+            raise
+    
+    # Concatenate all chunks
+    print(f"[TTS] Concatenating {len(chunk_wav_paths)} audio chunks...")
+    concatenate_wav_files(chunk_wav_paths, output_path)
+    
+    print(f"[TTS] Complete: {cumulative_duration:.1f}s total audio")
+    return all_captions, cumulative_duration
 
 CUDA = os.environ.get("CUDA", "0")
 if CUDA == "1" and torch.cuda.is_available():
@@ -272,17 +392,23 @@ def process_video_queue():
                     print("creating narration")
                     sound_path = os.path.join(video_dir, "sound.wav")
                     segments = []
-                    if LANGUAGE_VOICE_MAP[data["voice"]]["international"]:
+                    is_international = LANGUAGE_VOICE_MAP[data["voice"]]["international"]
+                    text_len = len(data["text"])
+                    use_chunked = text_len > TTS_CHUNK_CHARS
+                    
+                    if use_chunked:
+                        print(f"[TTS] Large text ({text_len} chars), using chunked processing")
+                        captions, audio_length = create_tts_chunked(
+                            text=data["text"], output_path=sound_path,
+                            lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
+                            voice=data["voice"],
+                            is_international=is_international,
+                        )
+                    elif is_international:
                         captions, audio_length = create_tts_international(
                             text=data["text"], output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
-                        )
-                        max_line_length = 30
-                        if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "z":
-                            max_line_length = 15
-                        segments = create_subtitle_segments_international(
-                            captions=captions, max_length=max_line_length, lines=2,
                         )
                     else:
                         captions, audio_length = create_tts_english(
@@ -290,6 +416,15 @@ def process_video_queue():
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                         )
+                    
+                    if is_international:
+                        max_line_length = 30
+                        if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "z":
+                            max_line_length = 15
+                        segments = create_subtitle_segments_international(
+                            captions=captions, max_length=max_line_length, lines=2,
+                        )
+                    else:
                         segments = create_subtitle_segments_english(
                             captions=captions, max_length=30, lines=2
                         )
@@ -325,6 +460,7 @@ def process_video_queue():
                     
                     videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
+                    gc.collect()  # Free memory after processing
                     print(f"Completed video: {video_id}")
                 
                 video_queue.task_done()
