@@ -297,137 +297,9 @@ VIDEOS_DIR = os.path.join(WORK_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 SHELVE_FILE_PATH = os.path.join(WORK_DIR, "videos_db")
 
-# ═══════════════════════════════
-# GOOGLE DRIVE — Upload videos for persistent storage
-# ═══════════════════════════════
-
-GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "")
-GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "")
-GDRIVE_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN", "")
-GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "")
-GDRIVE_ENABLED = bool(GDRIVE_CLIENT_ID and GDRIVE_CLIENT_SECRET and GDRIVE_REFRESH_TOKEN and GDRIVE_FOLDER_ID)
-
-if GDRIVE_ENABLED:
-    print(f"[GDRIVE] Enabled — folder: {GDRIVE_FOLDER_ID}")
-else:
-    print("[GDRIVE] Disabled — set GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN, GDRIVE_FOLDER_ID to enable")
-
-def gdrive_get_access_token():
-    """Get a fresh access token using the refresh token."""
-    resp = requests.post("https://oauth2.googleapis.com/token", data={
-        "client_id": GDRIVE_CLIENT_ID,
-        "client_secret": GDRIVE_CLIENT_SECRET,
-        "refresh_token": GDRIVE_REFRESH_TOKEN,
-        "grant_type": "refresh_token"
-    }, timeout=30)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-def gdrive_upload_video(local_path, filename):
-    """Upload video to Google Drive, return shareable download URL."""
-    if not GDRIVE_ENABLED:
-        return None
-    
-    try:
-        access_token = gdrive_get_access_token()
-        headers = {"Authorization": f"Bearer {access_token}"}
-        file_size = os.path.getsize(local_path)
-        print(f"[GDRIVE] Uploading {filename} ({file_size / 1024 / 1024:.1f} MB)...")
-        
-        # Step 1: Initiate resumable upload
-        metadata = json.dumps({
-            "name": filename,
-            "parents": [GDRIVE_FOLDER_ID],
-            "mimeType": "video/mp4"
-        })
-        
-        init_resp = requests.post(
-            "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Upload-Content-Type": "video/mp4",
-                "X-Upload-Content-Length": str(file_size)
-            },
-            data=metadata,
-            timeout=30
-        )
-        init_resp.raise_for_status()
-        upload_url = init_resp.headers["Location"]
-        
-        # Step 2: Upload in chunks (50MB each for large files)
-        UPLOAD_CHUNK = 50 * 1024 * 1024  # 50MB
-        uploaded = 0
-        
-        with open(local_path, 'rb') as f:
-            while uploaded < file_size:
-                chunk_data = f.read(UPLOAD_CHUNK)
-                chunk_size = len(chunk_data)
-                end = uploaded + chunk_size - 1
-                
-                chunk_resp = requests.put(
-                    upload_url,
-                    headers={
-                        "Content-Range": f"bytes {uploaded}-{end}/{file_size}",
-                        "Content-Type": "video/mp4"
-                    },
-                    data=chunk_data,
-                    timeout=300
-                )
-                
-                uploaded += chunk_size
-                progress = (uploaded / file_size) * 100
-                
-                if chunk_resp.status_code in [200, 201]:
-                    # Upload complete
-                    file_data = chunk_resp.json()
-                    file_id = file_data["id"]
-                    print(f"[GDRIVE] Upload complete: {file_id}")
-                elif chunk_resp.status_code == 308:
-                    # Resume incomplete — more chunks needed
-                    print(f"[GDRIVE] Progress: {progress:.0f}%")
-                else:
-                    raise Exception(f"Upload chunk failed: {chunk_resp.status_code} {chunk_resp.text[:200]}")
-        
-        # Step 3: Make file accessible via link
-        requests.post(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            },
-            data=json.dumps({"role": "reader", "type": "anyone"}),
-            timeout=30
-        )
-        
-        # Return direct download URL
-        drive_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-        print(f"[GDRIVE] URL: {drive_url}")
-        return drive_url
-        
-    except Exception as e:
-        print(f"[GDRIVE] Upload failed: {e}")
-        return None
-
-def gdrive_delete_file(drive_url):
-    """Delete a file from Google Drive by its URL."""
-    if not GDRIVE_ENABLED or not drive_url:
-        return
-    try:
-        # Extract file ID from URL
-        match = re.search(r'id=([^&]+)', drive_url)
-        if not match:
-            return
-        file_id = match.group(1)
-        access_token = gdrive_get_access_token()
-        requests.delete(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=30
-        )
-        print(f"[GDRIVE] Deleted: {file_id}")
-    except Exception as e:
-        print(f"[GDRIVE] Delete failed: {e}")
+## Video storage note:
+## Videos are stored locally temporarily. Job 5 (n8n) handles upload to Google Drive
+## and calls DELETE /api/videos/{id} to clean up local files after upload.
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
@@ -681,25 +553,11 @@ def process_video_queue():
                     except Exception as cleanup_error:
                         print(f"Warning: Failed to clean up: {cleanup_error}")
                     
-                    # Upload to Google Drive if enabled
-                    drive_url = None
-                    if GDRIVE_ENABLED:
-                        drive_url = gdrive_upload_video(video_path, f"{video_id}.mp4")
-                        if drive_url:
-                            videos[video_id]["drive_url"] = drive_url
-                            # Delete local file to save disk space
-                            try:
-                                os.remove(video_path)
-                                print(f"[DISK] Deleted local: {video_path}")
-                            except Exception as e:
-                                print(f"[DISK] Failed to delete local: {e}")
-                        else:
-                            print("[GDRIVE] Upload failed, keeping local file")
-                    
                     videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
                     gc.collect()
-                    print(f"Completed video: {video_id} | Drive: {drive_url or 'local'}")
+                    video_size = os.path.getsize(video_path) / 1024 / 1024
+                    print(f"Completed video: {video_id} ({video_size:.1f} MB) — waiting for n8n to pick up")
                 
                 video_queue.task_done()
             else:
@@ -767,28 +625,27 @@ def create_video(video: dict):
 def get_video(video_id: str):
     if video_id in videos:
         result = {"video_id": video_id, "status": videos[video_id]["status"]}
-        if "drive_url" in videos[video_id]:
-            result["video_url"] = videos[video_id]["drive_url"]
-        elif videos[video_id]["status"] == VideoStatus.COMPLETED:
-            result["video_url"] = f"/api/videos/{video_id}"
+        if videos[video_id]["status"] == VideoStatus.COMPLETED:
+            video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+            if os.path.exists(video_path):
+                result["video_url"] = f"/api/videos/{video_id}"
+                result["size_mb"] = round(os.path.getsize(video_path) / 1024 / 1024, 1)
+            else:
+                result["video_url"] = None
+                result["note"] = "File already cleaned up"
         return result
     return {"video_id": video_id, "status": "not_found"}
 
 @app.get("/api/videos/{video_id}")
 def download_video(video_id: str, download: bool = False):
     if video_id in videos and videos[video_id]["status"] == VideoStatus.COMPLETED:
-        # If video is on Google Drive, redirect
-        drive_url = videos[video_id].get("drive_url")
-        if drive_url:
-            from fastapi.responses import RedirectResponse
-            return RedirectResponse(url=drive_url)
-        # Otherwise serve local file
         video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
         if os.path.exists(video_path):
             return StreamingResponse(
                 iterfile(video_path), media_type="video/mp4",
                 headers={"Content-Disposition": f'attachment; filename="{video_id}.mp4"'}
             )
+        return JSONResponse(content={"video_id": video_id, "status": "file_cleaned"}, status_code=status.HTTP_410_GONE)
     elif video_id in videos:
         if videos[video_id]["status"] == VideoStatus.FAILED:
             return JSONResponse(content={"video_id": video_id, "status": VideoStatus.FAILED}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -798,62 +655,35 @@ def download_video(video_id: str, download: bool = False):
 
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str):
+    """Delete video file and metadata. Called by n8n after uploading to Google Drive."""
     if video_id in videos:
-        # Delete from Drive if present
-        drive_url = videos[video_id].get("drive_url")
-        if drive_url:
-            gdrive_delete_file(drive_url)
-        # Delete local file if present
         video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+        freed = 0
         if os.path.exists(video_path):
+            freed = os.path.getsize(video_path)
             os.remove(video_path)
+            print(f"[DISK] Deleted {video_id}: {freed / 1024 / 1024:.1f} MB freed")
         del videos[video_id]
         save_videos()
-        return {"video_id": video_id, "status": VideoStatus.DELETED}
+        return {"video_id": video_id, "status": VideoStatus.DELETED, "freed_mb": round(freed / 1024 / 1024, 1)}
     return {"video_id": video_id, "status": VideoStatus.NOT_FOUND}
 
 @app.get("/api/disk")
 def disk_status():
-    """Show disk usage and video storage info."""
-    local_videos = []
-    drive_videos = []
-    total_local_size = 0
+    """Show disk usage for video storage."""
+    entries = []
+    total_size = 0
     for vid, data in videos.items():
         path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
-        local_exists = os.path.exists(path)
-        size = os.path.getsize(path) if local_exists else 0
-        entry = {"video_id": vid, "status": data["status"], "local": local_exists, "size_mb": round(size / 1024 / 1024, 1)}
-        if data.get("drive_url"):
-            entry["drive_url"] = data["drive_url"]
-            drive_videos.append(entry)
-        else:
-            local_videos.append(entry)
-        if local_exists:
-            total_local_size += size
-    
+        exists = os.path.exists(path)
+        size = os.path.getsize(path) if exists else 0
+        entries.append({"video_id": vid, "status": data["status"], "local": exists, "size_mb": round(size / 1024 / 1024, 1)})
+        total_size += size
     return {
-        "gdrive_enabled": GDRIVE_ENABLED,
-        "local_count": len(local_videos),
-        "drive_count": len(drive_videos),
-        "total_local_mb": round(total_local_size / 1024 / 1024, 1),
-        "local_videos": local_videos,
-        "drive_videos": drive_videos
+        "total_videos": len(entries),
+        "total_local_mb": round(total_size / 1024 / 1024, 1),
+        "videos": entries
     }
-
-@app.post("/api/disk/cleanup")
-def disk_cleanup():
-    """Delete local video files that are already on Google Drive."""
-    cleaned = 0
-    freed_bytes = 0
-    for vid, data in videos.items():
-        if data.get("drive_url"):
-            path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
-            if os.path.exists(path):
-                size = os.path.getsize(path)
-                os.remove(path)
-                freed_bytes += size
-                cleaned += 1
-    return {"cleaned": cleaned, "freed_mb": round(freed_bytes / 1024 / 1024, 1)}
 
 @app.get("/api/queue")
 def get_queue_status():
