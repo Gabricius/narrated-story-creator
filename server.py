@@ -61,7 +61,15 @@ import wave
 # CHUNKED TTS — Process large texts in pieces to avoid OOM
 # ═══════════════════════════════
 
-TTS_CHUNK_CHARS = 3000  # Max chars per TTS chunk (~3 min audio each)
+TTS_CHUNK_CHARS = 1500  # Max chars per TTS chunk (~1.5 min audio each, safer for low RAM)
+
+def get_memory_mb():
+    """Get current process memory usage in MB."""
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # Linux: KB → MB
+    except:
+        return 0
 
 def split_text_into_chunks(text, max_chars=TTS_CHUNK_CHARS):
     """Split text into chunks at sentence boundaries."""
@@ -105,32 +113,102 @@ def concatenate_wav_files(wav_paths, output_path):
             pass
 
 def create_tts_chunked(text, output_path, lang_code, voice, is_international=False):
-    """Process TTS in chunks to avoid OOM on large texts."""
+    """Process TTS in isolated subprocesses to avoid OOM.
+    
+    Each chunk runs in a separate Python process that loads the model,
+    generates audio, saves results, and exits — releasing ALL memory back to OS.
+    """
+    import subprocess as sp
+    
     chunks = split_text_into_chunks(text)
     total_chunks = len(chunks)
-    print(f"[TTS] Processing {len(text)} chars in {total_chunks} chunks")
+    print(f"[TTS] Processing {len(text)} chars in {total_chunks} chunks (max {TTS_CHUNK_CHARS} chars/chunk)")
+    print(f"[TTS] Using SUBPROCESS isolation to prevent OOM")
+    print(f"[TTS] Memory before start: {get_memory_mb():.0f} MB")
     
     all_captions = []
     chunk_wav_paths = []
     cumulative_duration = 0.0
     
+    video_dir = os.path.dirname(output_path)
+    
     for i, chunk_text in enumerate(chunks):
         chunk_path = output_path.replace('.wav', f'_chunk{i}.wav')
-        print(f"[TTS] Chunk {i+1}/{total_chunks}: {len(chunk_text)} chars")
+        chunk_text_path = os.path.join(video_dir, f'chunk_{i}_text.txt')
+        chunk_captions_path = os.path.join(video_dir, f'chunk_{i}_captions.json')
         
+        print(f"[TTS] Chunk {i+1}/{total_chunks}: {len(chunk_text)} chars | Memory: {get_memory_mb():.0f} MB")
+        
+        # Write chunk text to file (avoids command line length limits)
+        with open(chunk_text_path, 'w', encoding='utf-8') as f:
+            f.write(chunk_text)
+        
+        # Build subprocess script
+        tts_func = 'create_tts_international' if is_international else 'create_tts_english'
+        worker_script = f'''
+import json, sys
+sys.path.insert(0, '/app')
+from video_maker import {tts_func}
+
+with open("{chunk_text_path}", "r", encoding="utf-8") as f:
+    text = f.read()
+
+captions, audio_length = {tts_func}(
+    text=text, output_path="{chunk_path}",
+    lang_code="{lang_code}", voice="{voice}",
+)
+
+# Serialize captions to JSON
+serializable = []
+for cap in captions:
+    if isinstance(cap, dict):
+        serializable.append(cap)
+    elif isinstance(cap, (list, tuple)):
+        serializable.append(list(cap))
+    else:
+        serializable.append(str(cap))
+
+with open("{chunk_captions_path}", "w") as f:
+    json.dump({{"captions": serializable, "audio_length": audio_length}}, f)
+
+print(f"CHUNK_OK audio_length={{audio_length:.2f}}")
+'''
+        
+        worker_script_path = os.path.join(video_dir, f'chunk_{i}_worker.py')
+        with open(worker_script_path, 'w') as f:
+            f.write(worker_script)
+        
+        # Run in subprocess — all model memory is freed when process exits
         try:
-            if is_international:
-                captions, audio_length = create_tts_international(
-                    text=chunk_text, output_path=chunk_path,
-                    lang_code=lang_code, voice=voice,
-                )
-            else:
-                captions, audio_length = create_tts_english(
-                    text=chunk_text, output_path=chunk_path,
-                    lang_code=lang_code, voice=voice,
-                )
+            result = sp.run(
+                ['python3', worker_script_path],
+                capture_output=True, text=True,
+                timeout=600,  # 10 min max per chunk
+                cwd='/app'
+            )
             
-            # Adjust caption timestamps by cumulative offset
+            print(f"[TTS] Subprocess stdout: {result.stdout[-200:] if result.stdout else '(empty)'}")
+            if result.stderr:
+                # Filter out warnings, only show errors
+                errors = [l for l in result.stderr.split('\n') 
+                         if l and not any(w in l for w in ['Warning', 'WARNING', 'FutureWarning', 'UserWarning', 'notice', 'pip'])]
+                if errors:
+                    print(f"[TTS] Subprocess errors: {chr(10).join(errors[-5:])}")
+            
+            if result.returncode != 0:
+                raise Exception(f"TTS subprocess failed (exit {result.returncode}): {result.stderr[-500:]}")
+            
+            # Read captions from JSON file
+            if not os.path.exists(chunk_captions_path):
+                raise Exception(f"TTS subprocess didn't produce captions file")
+            
+            with open(chunk_captions_path, 'r') as f:
+                chunk_result = json.load(f)
+            
+            captions = chunk_result['captions']
+            audio_length = chunk_result['audio_length']
+            
+            # Adjust timestamps by cumulative offset
             adjusted_captions = []
             for cap in captions:
                 if isinstance(cap, dict):
@@ -141,11 +219,10 @@ def create_tts_chunked(text, output_path, lang_code, voice, is_international=Fal
                         adj['end'] += cumulative_duration
                     adjusted_captions.append(adj)
                 elif isinstance(cap, (list, tuple)) and len(cap) >= 3:
-                    # (start, end, text, ...) format
                     cap_list = list(cap)
                     cap_list[0] += cumulative_duration
                     cap_list[1] += cumulative_duration
-                    adjusted_captions.append(tuple(cap_list) if isinstance(cap, tuple) else cap_list)
+                    adjusted_captions.append(cap_list)
                 else:
                     adjusted_captions.append(cap)
             
@@ -153,26 +230,28 @@ def create_tts_chunked(text, output_path, lang_code, voice, is_international=Fal
             chunk_wav_paths.append(chunk_path)
             cumulative_duration += audio_length
             
-            print(f"[TTS] Chunk {i+1} done: {audio_length:.1f}s (total: {cumulative_duration:.1f}s)")
+            print(f"[TTS] Chunk {i+1} done: {audio_length:.1f}s (total: {cumulative_duration:.1f}s) | Memory: {get_memory_mb():.0f} MB")
             
-            # Force garbage collection between chunks
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
+        except sp.TimeoutExpired:
+            print(f"[TTS] Chunk {i+1} timed out after 600s")
+            raise Exception(f"TTS chunk {i+1} timed out")
         except Exception as e:
             print(f"[TTS] Chunk {i+1} failed: {e}")
-            # Clean up any chunk files
             for p in chunk_wav_paths:
                 try: os.remove(p)
                 except: pass
             raise
+        finally:
+            # Clean up temp files for this chunk
+            for tmp in [chunk_text_path, chunk_captions_path, worker_script_path]:
+                try: os.remove(tmp)
+                except: pass
     
     # Concatenate all chunks
     print(f"[TTS] Concatenating {len(chunk_wav_paths)} audio chunks...")
     concatenate_wav_files(chunk_wav_paths, output_path)
     
-    print(f"[TTS] Complete: {cumulative_duration:.1f}s total audio")
+    print(f"[TTS] Complete: {cumulative_duration:.1f}s total audio | Memory: {get_memory_mb():.0f} MB")
     return all_captions, cumulative_duration
 
 CUDA = os.environ.get("CUDA", "0")
@@ -199,8 +278,17 @@ else:
     else:
         print("File /sys/fs/cgroup/cpu.max not found, using os.cpu_count()")
     
-    num_threads = os.environ.get("NUM_THREADS", num_cores * 1.5)
+    # Use fewer threads to reduce memory overhead on low-RAM containers
+    num_threads = os.environ.get("NUM_THREADS", max(1, num_cores))
     torch.set_num_threads(int(num_threads))
+    # Reduce interop threads too
+    torch.set_num_interop_threads(1)
+    print(f"[MEM] Torch threads: {num_threads}, interop: 1")
+
+# Memory optimization for low-RAM environments
+os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
+os.environ.setdefault("MALLOC_TRIM_THRESHOLD_", "65536")
+print(f"[MEM] Initial memory: {get_memory_mb():.0f} MB")
 
 WORK_DIR = os.environ.get('WORK_DIR', os.getcwd())
 TMP_DIR = os.path.join(WORK_DIR, "tmp")
@@ -390,6 +478,9 @@ def process_video_queue():
                     )
                     
                     print("creating narration")
+                    # Free memory before heavy TTS processing
+                    gc.collect()
+                    print(f"[MEM] Before TTS: {get_memory_mb():.0f} MB")
                     sound_path = os.path.join(video_dir, "sound.wav")
                     segments = []
                     is_international = LANGUAGE_VOICE_MAP[data["voice"]]["international"]
