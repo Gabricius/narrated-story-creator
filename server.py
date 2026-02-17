@@ -777,29 +777,36 @@ def process_video_request(
     if not person_image_url.startswith("http"):
         return None, None, "Invalid person_image_url: should start with http"
     
+    # Trusted domains — skip HEAD validation (Google Drive doesn't handle HEAD well)
+    TRUSTED_DOMAINS = ["drive.google.com", "googleapis.com", "supabase.co", "cloudflare", "easypanel.host"]
+
     # Check background video
-    try:
-        response = requests.head(bg_video_url, timeout=10, allow_redirects=True)
-        if response.status_code not in [200, 302, 303]:
-            return None, None, f"Background video not accessible: {response.status_code}"
-        if not any(d in bg_video_url for d in ["drive.google.com", "googleapis.com", "supabase.co"]):
+    if not any(d in bg_video_url for d in TRUSTED_DOMAINS):
+        try:
+            response = requests.head(bg_video_url, timeout=10, allow_redirects=True)
+            if response.status_code not in [200, 302, 303]:
+                return None, None, f"Background video not accessible: {response.status_code}"
             ext = os.path.splitext(bg_video_url)[1].lower().split('?')[0]
             if ext and ext not in [".mp4", ".mov", ".avi", ".webm"]:
                 return None, None, "Invalid bg_video_url: should be a video file"
-    except Exception as e:
-        return None, None, f"Error checking bg_video_url: {str(e)}"
+        except Exception as e:
+            return None, None, f"Error checking bg_video_url: {str(e)}"
+    else:
+        print(f"[VALIDATE] Skipping HEAD check for trusted domain: {bg_video_url[:60]}...")
 
     # Check person image
-    try:
-        response = requests.head(person_image_url, timeout=10, allow_redirects=True)
-        if response.status_code not in [200, 302, 303]:
-            return None, None, f"Person image not accessible: {response.status_code}"
-        if not any(d in person_image_url for d in ["drive.google.com", "googleapis.com", "supabase.co", "cloudflare"]):
+    if not any(d in person_image_url for d in TRUSTED_DOMAINS):
+        try:
+            response = requests.head(person_image_url, timeout=10, allow_redirects=True)
+            if response.status_code not in [200, 302, 303]:
+                return None, None, f"Person image not accessible: {response.status_code}"
             ext = os.path.splitext(person_image_url)[1].lower().split('?')[0]
             if ext and ext not in [".jpg", ".jpeg", ".png", ".webp"]:
                 return None, None, "Invalid person_image_url: should be an image file"
-    except Exception as e:
-        return None, None, f"Error checking person_image_url: {str(e)}"
+        except Exception as e:
+            return None, None, f"Error checking person_image_url: {str(e)}"
+    else:
+        print(f"[VALIDATE] Skipping HEAD check for trusted domain: {person_image_url[:60]}...")
     
     if voice not in LANGUAGE_VOICE_MAP:
         return None, None, f"Invalid voice: {voice}. Available: {list(LANGUAGE_VOICE_MAP.keys())}"
