@@ -386,6 +386,81 @@ def rclone_upload_video(local_path, filename, folder_id=None):
         print(f"[RCLONE] Error: {e}")
         return None
 
+def setup_rclone():
+    """Install rclone if needed and configure from environment variables."""
+    import subprocess as sp
+    
+    # Check if already installed
+    try:
+        result = sp.run(["rclone", "version"], capture_output=True, timeout=10)
+        if result.returncode == 0:
+            version = result.stdout.decode().split('\n')[0] if result.stdout else 'unknown'
+            print(f"[RCLONE] Already installed: {version}")
+    except (FileNotFoundError, Exception):
+        print("[RCLONE] Not found, installing...")
+        try:
+            install = sp.run(
+                ["bash", "-c", "curl -s https://rclone.org/install.sh | bash"],
+                capture_output=True, text=True, timeout=120
+            )
+            if install.returncode == 0:
+                print("[RCLONE] Installed successfully")
+            else:
+                print(f"[RCLONE] Install failed: {install.stderr[-200:]}")
+                return False
+        except Exception as e:
+            print(f"[RCLONE] Install error: {e}")
+            return False
+    
+    # Write config from environment variables
+    # Supports either RCLONE_CONFIG_GDRIVE_* env vars (native rclone)
+    # or our GDRIVE_RCLONE_TOKEN env var
+    rclone_token = os.environ.get("RCLONE_DRIVE_TOKEN", "")
+    rclone_client_id = os.environ.get("RCLONE_DRIVE_CLIENT_ID", "")
+    rclone_client_secret = os.environ.get("RCLONE_DRIVE_CLIENT_SECRET", "")
+    
+    if rclone_token:
+        config_dir = os.path.expanduser("~/.config/rclone")
+        os.makedirs(config_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "rclone.conf")
+        
+        config_content = f"""[{RCLONE_REMOTE}]
+type = drive
+client_id = {rclone_client_id}
+client_secret = {rclone_client_secret}
+scope = drive
+token = {rclone_token}
+team_drive = 
+"""
+        with open(config_path, 'w') as f:
+            f.write(config_content)
+        print(f"[RCLONE] Config written to {config_path}")
+    else:
+        # Check if config already exists (mounted volume or pre-installed)
+        config_path = os.path.expanduser("~/.config/rclone/rclone.conf")
+        if os.path.exists(config_path):
+            print(f"[RCLONE] Using existing config: {config_path}")
+        else:
+            print("[RCLONE] No GDRIVE_RCLONE_TOKEN env var and no config file found")
+            print("[RCLONE] Set GDRIVE_RCLONE_TOKEN with the token JSON from rclone.conf")
+            return False
+    
+    # Verify it works
+    try:
+        test = sp.run(
+            ["rclone", "about", f"{RCLONE_REMOTE}:", "--json"],
+            capture_output=True, text=True, timeout=15
+        )
+        if test.returncode == 0:
+            print(f"[RCLONE] Connection verified ✓")
+            return True
+        else:
+            print(f"[RCLONE] Connection test failed: {test.stderr[:200]}")
+            return False
+    except Exception as e:
+        print(f"[RCLONE] Connection test error: {e}")
+        return False
+
 def rclone_available():
     """Check if rclone is installed and configured."""
     try:
@@ -395,10 +470,12 @@ def rclone_available():
     except:
         return False
 
-if rclone_available():
-    print(f"[RCLONE] Available — remote: {RCLONE_REMOTE}, folder: {RCLONE_FOLDER_ID or '(not set)'}")
+# Auto-setup rclone on startup
+_rclone_ok = setup_rclone()
+if _rclone_ok:
+    print(f"[RCLONE] Ready — remote: {RCLONE_REMOTE}, folder: {RCLONE_FOLDER_ID or '(not set)'}")
 else:
-    print("[RCLONE] Not installed — videos will stay local")
+    print("[RCLONE] Not available — videos will stay local")
 
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks
 
@@ -852,6 +929,48 @@ def disk_status():
         "rclone_available": rclone_available(),
         "videos": entries
     }
+
+@app.post("/api/disk/upload-to-drive")
+def upload_local_to_drive(video_id: str = None):
+    """Manually upload local video(s) to Google Drive via rclone."""
+    if not rclone_available():
+        return JSONResponse(content={"error": "rclone not available"}, status_code=503)
+    if not RCLONE_FOLDER_ID:
+        return JSONResponse(content={"error": "GDRIVE_FOLDER_ID not set"}, status_code=503)
+    
+    results = []
+    targets = []
+    
+    if video_id:
+        if video_id in videos:
+            targets.append(video_id)
+        else:
+            return JSONResponse(content={"error": "Video not found"}, status_code=404)
+    else:
+        # All local completed videos without drive_url
+        targets = [vid for vid, data in videos.items() 
+                   if data["status"] == VideoStatus.COMPLETED and not data.get("drive_url")]
+    
+    for vid in targets:
+        video_path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
+        if not os.path.exists(video_path):
+            results.append({"video_id": vid, "status": "file_missing"})
+            continue
+        
+        size_mb = os.path.getsize(video_path) / 1024 / 1024
+        drive_url = rclone_upload_video(video_path, f"{vid}.mp4")
+        if drive_url:
+            videos[vid]["drive_url"] = drive_url
+            save_videos()
+            try:
+                os.remove(video_path)
+            except:
+                pass
+            results.append({"video_id": vid, "status": "uploaded", "drive_url": drive_url, "freed_mb": round(size_mb, 1)})
+        else:
+            results.append({"video_id": vid, "status": "upload_failed"})
+    
+    return {"uploaded": len([r for r in results if r["status"] == "uploaded"]), "results": results}
 
 @app.get("/api/queue")
 def get_queue_status():
