@@ -760,7 +760,9 @@ def process_video_queue():
                     # Upload to Google Drive via rclone if available
                     drive_url = None
                     if rclone_available() and RCLONE_FOLDER_ID:
-                        drive_url = rclone_upload_video(video_path, f"{video_id}.mp4")
+                        # Use per-channel folder if specified, otherwise global
+                        folder_id = data.get("gdrive_folder_id") or RCLONE_FOLDER_ID
+                        drive_url = rclone_upload_video(video_path, f"{video_id}.mp4", folder_id=folder_id)
                         if drive_url:
                             videos[video_id]["drive_url"] = drive_url
                             # Delete local file to save disk
@@ -826,7 +828,8 @@ def create_video(video: dict):
         bg_video_url=bg_video_url,
         voice=voice,
         overlay_bg_color=overlay_bg_color,
-        version=version
+        version=version,
+        gdrive_folder_id=video.get("gdrive_folder_id", "")
     )
     
     if error:
@@ -949,7 +952,8 @@ def upload_local_to_drive(video_id: str = None):
             continue
         
         size_mb = os.path.getsize(video_path) / 1024 / 1024
-        drive_url = rclone_upload_video(video_path, f"{vid}.mp4")
+        folder_id = videos[vid].get("data", {}).get("gdrive_folder_id") or RCLONE_FOLDER_ID
+        drive_url = rclone_upload_video(video_path, f"{vid}.mp4", folder_id=folder_id)
         if drive_url:
             videos[vid]["drive_url"] = drive_url
             save_videos()
@@ -969,6 +973,111 @@ def get_queue_status():
         "queue_size": video_queue.qsize(),
         "queued": len([v for v in videos.values() if v["status"] == VideoStatus.QUEUED]),
         "processing": len([v for v in videos.values() if v["status"] == VideoStatus.PROCESSING])
+    }
+
+@app.get("/api/diagnostics")
+def run_diagnostics():
+    """Quick health check of all subsystems."""
+    results = {}
+    
+    # 1. Server health
+    results["server"] = {"status": "ok", "memory_mb": round(get_memory_mb(), 0)}
+    
+    # 2. Rclone
+    results["rclone"] = {
+        "installed": rclone_available(),
+        "folder_id": RCLONE_FOLDER_ID or "(not set)"
+    }
+    if rclone_available() and RCLONE_FOLDER_ID:
+        try:
+            import subprocess as sp
+            test = sp.run(
+                ["rclone", "lsd", f"{RCLONE_REMOTE}:", "--drive-root-folder-id", RCLONE_FOLDER_ID],
+                capture_output=True, text=True, timeout=15
+            )
+            results["rclone"]["connection"] = "ok" if test.returncode == 0 else f"error: {test.stderr[:100]}"
+        except Exception as e:
+            results["rclone"]["connection"] = f"error: {e}"
+    
+    # 3. Supabase Storage (for ImageFX)
+    supabase_url = os.environ.get("SUPABASE_URL", "")
+    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    results["supabase_storage"] = {
+        "configured": bool(supabase_url and supabase_key),
+        "url": supabase_url[:40] + "..." if supabase_url else "(not set)"
+    }
+    
+    # 4. Disk space
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage("/")
+        results["disk"] = {
+            "total_gb": round(total / (1024**3), 1),
+            "used_gb": round(used / (1024**3), 1),
+            "free_gb": round(free / (1024**3), 1),
+            "used_pct": round(used / total * 100, 1)
+        }
+    except:
+        results["disk"] = {"status": "error"}
+    
+    # 5. Videos summary
+    statuses = {}
+    for v in videos.values():
+        s = v["status"]
+        statuses[s] = statuses.get(s, 0) + 1
+    results["videos"] = statuses
+    
+    # 6. TTS test (import only, no generation)
+    try:
+        import importlib
+        vm = importlib.import_module("video_maker")
+        results["tts"] = {"video_maker": "ok", "functions": [
+            f for f in ["create_tts_english", "create_tts_international", "render_video", 
+                       "create_subtitle_v2_karaoke", "create_overlay"]
+            if hasattr(vm, f)
+        ]}
+    except Exception as e:
+        results["tts"] = {"video_maker": f"error: {e}"}
+    
+    # 7. FFmpeg
+    try:
+        import subprocess as sp
+        ff = sp.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        version_line = ff.stdout.split('\n')[0] if ff.stdout else "unknown"
+        results["ffmpeg"] = {"status": "ok", "version": version_line}
+    except:
+        results["ffmpeg"] = {"status": "not found"}
+    
+    return results
+
+@app.post("/api/test-video")
+def create_test_video(gdrive_folder_id: str = ""):
+    """Create a tiny 5-second test video to validate the full pipeline.
+    Tests: TTS, subtitle generation, overlay, rendering, rclone upload."""
+    test_text = "This is a quick test video to validate the pipeline. Everything seems to be working correctly."
+    
+    video_id, video_data, error = process_video_request(
+        text=test_text,
+        person_image_url="https://tpvkeohgrkimcxsbjvta.supabase.co/storage/v1/object/public/imagefx/test_person.png",
+        person_name="Test",
+        bg_video_url=os.environ.get("TEST_BG_VIDEO_URL", ""),
+        voice="af_heart",
+        version="v2",
+        gdrive_folder_id=gdrive_folder_id or RCLONE_FOLDER_ID
+    )
+    
+    if error:
+        return {"error": error, "hint": "Set TEST_BG_VIDEO_URL env var with a valid bg video URL"}
+    
+    videos[video_id] = video_data
+    save_videos()
+    video_queue.put(video_id)
+    return {
+        "video_id": video_id,
+        "status": "queued",
+        "test": True,
+        "text_length": len(test_text),
+        "note": "Monitor at /api/videos/{video_id}/status"
     }
 
 ### ImageFX (Google AI Image Generation) ###
@@ -1304,7 +1413,8 @@ async def handle_sse(request: Request):
 
 def process_video_request(
     text: str, person_image_url: str, person_name: str, bg_video_url: str,
-    voice: str = "af_heart", overlay_bg_color: tuple = (232, 14, 64), version: str = "v1"
+    voice: str = "af_heart", overlay_bg_color: tuple = (232, 14, 64), version: str = "v1",
+    gdrive_folder_id: str = ""
 ) -> tuple[str, dict, str]:
     """Process video creation request."""
     if not text:
@@ -1362,6 +1472,7 @@ def process_video_request(
             "text": text, "person_name": person_name, "voice": voice,
             "overlay_bg_color": overlay_bg_color, "person_image_url": person_image_url,
             "bg_video_url": bg_video_url, "version": version,
+            "gdrive_folder_id": gdrive_folder_id,
         },
         "created_at": time.time()
     }
