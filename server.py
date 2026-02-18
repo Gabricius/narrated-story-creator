@@ -688,6 +688,19 @@ def process_video_queue():
                             voice=data["voice"],
                         )
                     
+                    # If captions came from chunked TTS, they're dicts from JSON.
+                    # Subtitle functions expect objects with attributes (.start, .end, .word).
+                    # Convert dicts to SimpleNamespace for compatibility.
+                    if use_chunked and captions and isinstance(captions[0], dict):
+                        from types import SimpleNamespace
+                        captions = [SimpleNamespace(**cap) for cap in captions]
+                        print(f"[CAPTIONS] Converted {len(captions)} dict captions to objects")
+                        # Debug: show first and last caption to verify timestamps
+                        if len(captions) > 1:
+                            first = captions[0]
+                            last = captions[-1]
+                            print(f"[CAPTIONS] First: start={first.start:.2f}s | Last: start={last.start:.2f}s end={last.end:.2f}s")
+                    
                     if is_international:
                         max_line_length = 30
                         if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "z":
@@ -1051,23 +1064,59 @@ def run_diagnostics():
     return results
 
 @app.post("/api/test-video")
-def create_test_video(gdrive_folder_id: str = ""):
-    """Create a tiny 5-second test video to validate the full pipeline.
-    Tests: TTS, subtitle generation, overlay, rendering, rclone upload."""
-    test_text = "This is a quick test video to validate the pipeline. Everything seems to be working correctly."
+def create_test_video(params: dict = {}):
+    """Create a test video to validate the full pipeline.
+    Accepts: bg_video_url, gdrive_folder_id, person_image_url, voice, chunks (2 or 3)
+    Tests: TTS, subtitle generation with timestamp offsets, overlay, rendering, rclone upload."""
+    
+    bg_video_url = params.get("bg_video_url", os.environ.get("TEST_BG_VIDEO_URL", ""))
+    gdrive_folder_id = params.get("gdrive_folder_id", RCLONE_FOLDER_ID)
+    person_image_url = params.get("person_image_url", "")
+    voice = params.get("voice", "af_heart")
+    num_chunks = int(params.get("chunks", 2))
+    
+    if not bg_video_url:
+        return JSONResponse(content={"error": "bg_video_url is required"}, status_code=400)
+    
+    # Build test text that creates multiple TTS chunks
+    # Each chunk ~1500 chars, so 2 chunks = ~3000 chars, 3 chunks = ~4500 chars
+    chunk_texts = [
+        # Chunk 1: ~1600 chars
+        "This is the first part of the test video. We need enough text to fill an entire chunk of the text to speech system. The purpose of this test is to verify that the subtitle timestamps are correctly offset when multiple chunks are concatenated together. Each chunk processes independently and generates its own set of captions starting from zero seconds. The main process then adjusts the timestamps by adding the cumulative duration of all previous chunks. For example if chunk one is thirty seconds long then all timestamps in chunk two should be offset by thirty seconds. This ensures that the subtitles appear at the correct time in the final concatenated audio. Without this offset correction all subtitles would pile up at the beginning of the video which is exactly the bug we are testing for. Let us continue with more text to make sure this chunk is long enough. The quick brown fox jumps over the lazy dog. Testing one two three four five six seven eight nine ten. We are almost at the character limit for this chunk now. Just a few more sentences should do it. The weather today is perfect for testing video generation pipelines.",
+        # Chunk 2: ~1600 chars
+        "Now we are in the second chunk of the test video. If the subtitle system is working correctly you should see these words appearing after the first chunk has finished. The timestamps should flow naturally from where the first chunk ended. This is the critical test. If you see all the subtitles from both chunks appearing at the very beginning of the video then the timestamp offset is not working. But if the subtitles from this second chunk appear roughly halfway through the video then everything is working perfectly. Let us add some more content to make this chunk substantial enough for a proper test. Remember that the text to speech system processes each chunk in a separate subprocess to avoid memory issues. The subprocess loads the model processes the text and then exits freeing all memory. The parent process reads the generated audio and caption files from disk. It then adjusts the caption timestamps and concatenates all the audio chunks into one final file. This approach allows us to process very long scripts without running out of memory. Even a thirty minute video with over thirty thousand characters can be processed this way.",
+        # Chunk 3: ~1600 chars (optional)
+        "This is the third and final chunk of our test video. By now you should have seen subtitles flowing naturally through the video with no gaps or overlaps between chunks. The third chunk is an extra validation to make sure the cumulative offset works across multiple boundaries not just one. Some edge cases only appear with three or more chunks such as floating point precision issues or off by one errors in the timestamp calculations. If you have made it this far and the subtitles look correct then congratulations the chunked text to speech pipeline is working perfectly. The video should also loop the background smoothly without any freezing or stuttering at the loop point. And if rclone is configured the finished video should automatically upload to Google Drive and the local file should be deleted to save disk space. Thank you for running this test. The pipeline is healthy and ready to produce real content. End of test video generation. This has been a comprehensive validation of all major subsystems including text to speech subtitle generation video rendering and cloud storage upload."
+    ]
+    
+    test_text = " ".join(chunk_texts[:num_chunks])
+    
+    # Use a default test person image if none provided
+    if not person_image_url:
+        # Try to find any character image from existing channels
+        for vid_data in videos.values():
+            d = vid_data.get("data", {})
+            if d.get("person_image_url"):
+                person_image_url = d["person_image_url"]
+                break
+    
+    if not person_image_url:
+        return JSONResponse(content={
+            "error": "person_image_url required. Pass it in body or generate at least one video first."
+        }, status_code=400)
     
     video_id, video_data, error = process_video_request(
         text=test_text,
-        person_image_url="https://tpvkeohgrkimcxsbjvta.supabase.co/storage/v1/object/public/imagefx/test_person.png",
+        person_image_url=person_image_url,
         person_name="Test",
-        bg_video_url=os.environ.get("TEST_BG_VIDEO_URL", ""),
-        voice="af_heart",
+        bg_video_url=bg_video_url,
+        voice=voice,
         version="v2",
-        gdrive_folder_id=gdrive_folder_id or RCLONE_FOLDER_ID
+        gdrive_folder_id=gdrive_folder_id
     )
     
     if error:
-        return {"error": error, "hint": "Set TEST_BG_VIDEO_URL env var with a valid bg video URL"}
+        return JSONResponse(content={"error": error}, status_code=400)
     
     videos[video_id] = video_data
     save_videos()
@@ -1076,8 +1125,9 @@ def create_test_video(gdrive_folder_id: str = ""):
         "video_id": video_id,
         "status": "queued",
         "test": True,
+        "chunks_expected": num_chunks,
         "text_length": len(test_text),
-        "note": "Monitor at /api/videos/{video_id}/status"
+        "note": f"~{num_chunks * 30}s video with {num_chunks} TTS chunks"
     }
 
 ### ImageFX (Google AI Image Generation) ###
