@@ -236,14 +236,13 @@ print(f"CHUNK_OK audio_length={{audio_length:.2f}} captions={{len(serializable)}
             for cap in captions:
                 if isinstance(cap, dict):
                     adj = dict(cap)
-                    # Handle multiple possible key names for start/end
-                    for start_key in ['start', 'start_time', 's']:
+                    for start_key in ['start', 'start_ts', 'start_time', 's']:
                         if start_key in adj:
-                            adj[start_key] += cumulative_duration
+                            adj[start_key] = float(adj[start_key]) + cumulative_duration
                             break
-                    for end_key in ['end', 'end_time', 'e']:
+                    for end_key in ['end', 'end_ts', 'end_time', 'e']:
                         if end_key in adj:
-                            adj[end_key] += cumulative_duration
+                            adj[end_key] = float(adj[end_key]) + cumulative_duration
                             break
                     adjusted_captions.append(adj)
                 elif isinstance(cap, (list, tuple)) and len(cap) >= 2:
@@ -702,30 +701,36 @@ def process_video_queue():
                             voice=data["voice"],
                         )
                     
-                    # If captions came from chunked TTS, normalize to objects with .start, .end, .word
+                    # If captions came from chunked TTS, normalize to standard format.
+                    # Downstream code uses BOTH cap['start'] and cap.start, so we need
+                    # a hybrid that supports both access patterns.
                     if use_chunked and captions:
                         sample = captions[0]
                         print(f"[CAPTIONS] Raw type: {type(sample).__name__} | Sample: {repr(sample)[:200]}")
                         if isinstance(sample, dict):
                             print(f"[CAPTIONS] Dict keys: {list(sample.keys())}")
                         
-                        from types import SimpleNamespace
+                        # Hybrid dict that supports both cap['key'] and cap.key
+                        class Cap(dict):
+                            __getattr__ = dict.__getitem__
+                            __setattr__ = dict.__setitem__
+                        
                         normalized = []
                         for cap in captions:
-                            if isinstance(cap, (list, tuple)) and len(cap) >= 3:
-                                normalized.append(SimpleNamespace(
-                                    start=float(cap[0]), end=float(cap[1]),
-                                    word=str(cap[2]) if len(cap) > 2 else ""
-                                ))
-                            elif isinstance(cap, dict):
-                                s = cap.get('start', cap.get('start_time', cap.get('s', 0)))
-                                e = cap.get('end', cap.get('end_time', cap.get('e', 0)))
+                            if isinstance(cap, dict):
+                                s = cap.get('start', cap.get('start_ts', cap.get('start_time', cap.get('s', 0))))
+                                e = cap.get('end', cap.get('end_ts', cap.get('end_time', cap.get('e', 0))))
                                 w = cap.get('word', cap.get('text', cap.get('w', '')))
-                                normalized.append(SimpleNamespace(start=float(s), end=float(e), word=str(w)))
+                                normalized.append(Cap(start=float(s), end=float(e), word=str(w), text=str(w),
+                                                      start_ts=float(s), end_ts=float(e)))
+                            elif isinstance(cap, (list, tuple)) and len(cap) >= 2:
+                                w = str(cap[2]) if len(cap) > 2 else ""
+                                normalized.append(Cap(start=float(cap[0]), end=float(cap[1]), word=w, text=w,
+                                                      start_ts=float(cap[0]), end_ts=float(cap[1])))
                             elif hasattr(cap, 'start') and hasattr(cap, 'end'):
                                 normalized.append(cap)
                             else:
-                                print(f"[CAPTIONS] WARNING: Unknown format: {type(cap).__name__} = {repr(cap)[:100]}")
+                                print(f"[CAPTIONS] WARNING: Unknown: {type(cap).__name__} = {repr(cap)[:100]}")
                         
                         captions = normalized
                         print(f"[CAPTIONS] Normalized {len(captions)} captions")
