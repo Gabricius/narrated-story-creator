@@ -224,15 +224,29 @@ print(f"CHUNK_OK audio_length={{audio_length:.2f}} captions={{len(serializable)}
             
             # Adjust timestamps by cumulative offset
             adjusted_captions = []
+            
+            # Log first caption structure for debugging
+            if captions and i == 0:
+                sample = captions[0]
+                if isinstance(sample, dict):
+                    print(f"[TTS] Caption format: dict with keys {list(sample.keys())}")
+                else:
+                    print(f"[TTS] Caption format: {type(sample).__name__} = {repr(sample)[:150]}")
+            
             for cap in captions:
                 if isinstance(cap, dict):
                     adj = dict(cap)
-                    if 'start' in adj:
-                        adj['start'] += cumulative_duration
-                    if 'end' in adj:
-                        adj['end'] += cumulative_duration
+                    # Handle multiple possible key names for start/end
+                    for start_key in ['start', 'start_time', 's']:
+                        if start_key in adj:
+                            adj[start_key] += cumulative_duration
+                            break
+                    for end_key in ['end', 'end_time', 'e']:
+                        if end_key in adj:
+                            adj[end_key] += cumulative_duration
+                            break
                     adjusted_captions.append(adj)
-                elif isinstance(cap, (list, tuple)) and len(cap) >= 3:
+                elif isinstance(cap, (list, tuple)) and len(cap) >= 2:
                     cap_list = list(cap)
                     cap_list[0] += cumulative_duration
                     cap_list[1] += cumulative_duration
@@ -688,18 +702,36 @@ def process_video_queue():
                             voice=data["voice"],
                         )
                     
-                    # If captions came from chunked TTS, they're dicts from JSON.
-                    # Subtitle functions expect objects with attributes (.start, .end, .word).
-                    # Convert dicts to SimpleNamespace for compatibility.
-                    if use_chunked and captions and isinstance(captions[0], dict):
+                    # If captions came from chunked TTS, normalize to objects with .start, .end, .word
+                    if use_chunked and captions:
+                        sample = captions[0]
+                        print(f"[CAPTIONS] Raw type: {type(sample).__name__} | Sample: {repr(sample)[:200]}")
+                        if isinstance(sample, dict):
+                            print(f"[CAPTIONS] Dict keys: {list(sample.keys())}")
+                        
                         from types import SimpleNamespace
-                        captions = [SimpleNamespace(**cap) for cap in captions]
-                        print(f"[CAPTIONS] Converted {len(captions)} dict captions to objects")
-                        # Debug: show first and last caption to verify timestamps
+                        normalized = []
+                        for cap in captions:
+                            if isinstance(cap, (list, tuple)) and len(cap) >= 3:
+                                normalized.append(SimpleNamespace(
+                                    start=float(cap[0]), end=float(cap[1]),
+                                    word=str(cap[2]) if len(cap) > 2 else ""
+                                ))
+                            elif isinstance(cap, dict):
+                                s = cap.get('start', cap.get('start_time', cap.get('s', 0)))
+                                e = cap.get('end', cap.get('end_time', cap.get('e', 0)))
+                                w = cap.get('word', cap.get('text', cap.get('w', '')))
+                                normalized.append(SimpleNamespace(start=float(s), end=float(e), word=str(w)))
+                            elif hasattr(cap, 'start') and hasattr(cap, 'end'):
+                                normalized.append(cap)
+                            else:
+                                print(f"[CAPTIONS] WARNING: Unknown format: {type(cap).__name__} = {repr(cap)[:100]}")
+                        
+                        captions = normalized
+                        print(f"[CAPTIONS] Normalized {len(captions)} captions")
                         if len(captions) > 1:
-                            first = captions[0]
-                            last = captions[-1]
-                            print(f"[CAPTIONS] First: start={first.start:.2f}s | Last: start={last.start:.2f}s end={last.end:.2f}s")
+                            print(f"[CAPTIONS] First: start={captions[0].start:.2f}s word='{captions[0].word}'")
+                            print(f"[CAPTIONS] Last: start={captions[-1].start:.2f}s end={captions[-1].end:.2f}s word='{captions[-1].word}'")
                     
                     if is_international:
                         max_line_length = 30
