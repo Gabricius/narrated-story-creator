@@ -14,6 +14,9 @@ WORKDIR /app
 # Copiar requirements.txt primeiro (para cache de layers do Docker)
 COPY requirements.txt .
 
+# Copiar rclone para acessar Google Drive
+COPY --from=rclone/rclone:latest /usr/local/bin/rclone /usr/bin/rclone
+
 # Instalar dependências Python
 RUN pip install --no-cache-dir -r requirements.txt
 
