@@ -715,42 +715,33 @@ def process_video_queue():
                             segments=segments, font_size=80, output_path=subtitle_path,
                         )
                     
-                    # Pre-process background video for smooth looping
-                    bg_duration = None
+                    # Trim bg video to remove trailing frozen frames for clean loop
+                    # FFmpeg stream_loop can stutter if the last frames are duplicated
                     try:
-                        import subprocess as sp_probe
-                        probe = sp_probe.run([
+                        import subprocess as sp_trim
+                        probe = sp_trim.run([
                             "ffprobe", "-v", "error",
                             "-show_entries", "format=duration",
                             "-of", "csv=p=0", bg_video_path
                         ], capture_output=True, text=True, timeout=10)
                         if probe.returncode == 0:
-                            bg_duration = float(probe.stdout.strip())
-                    except:
-                        pass
-                    
-                    # If bg video is shorter than audio, create palindrome (fwd+rev) for smooth loop
-                    if bg_duration and audio_length > bg_duration:
-                        print(f"[BG] Video ({bg_duration:.0f}s) shorter than audio ({audio_length:.0f}s) — creating smooth palindrome loop")
-                        palindrome_path = os.path.join(video_dir, "bg_palindrome.mp4")
-                        import subprocess as sp_ffmpeg
-                        # Create forward + reverse concatenation for seamless looping
-                        palindrome_result = sp_ffmpeg.run([
-                            "ffmpeg", "-y",
-                            "-i", bg_video_path,
-                            "-filter_complex",
-                            "[0:v]split[fwd][rev];[rev]reverse[reversed];[fwd][reversed]concat=n=2:v=1:a=0[out]",
-                            "-map", "[out]",
-                            "-an",
-                            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                            palindrome_path
-                        ], capture_output=True, text=True, timeout=300)
-                        
-                        if palindrome_result.returncode == 0 and os.path.exists(palindrome_path):
-                            bg_video_path = palindrome_path
-                            print(f"[BG] Palindrome created: {os.path.getsize(palindrome_path) / 1024 / 1024:.1f} MB")
-                        else:
-                            print(f"[BG] Palindrome failed, using original: {palindrome_result.stderr[-200:]}")
+                            bg_dur = float(probe.stdout.strip())
+                            trim_dur = bg_dur - 0.5  # Remove last 0.5s
+                            if trim_dur > 1:
+                                trimmed_path = os.path.join(video_dir, "bg_trimmed.mp4")
+                                trim_result = sp_trim.run([
+                                    "ffmpeg", "-y",
+                                    "-i", bg_video_path,
+                                    "-t", str(trim_dur),
+                                    "-c", "copy",  # No re-encode, instant
+                                    "-an",
+                                    trimmed_path
+                                ], capture_output=True, text=True, timeout=30)
+                                if trim_result.returncode == 0 and os.path.exists(trimmed_path):
+                                    bg_video_path = trimmed_path
+                                    print(f"[BG] Trimmed to {trim_dur:.1f}s for clean loop")
+                    except Exception as e:
+                        print(f"[BG] Trim skipped: {e}")
                     
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
