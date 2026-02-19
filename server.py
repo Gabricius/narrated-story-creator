@@ -1056,6 +1056,40 @@ def run_diagnostics():
         "configured": bool(supabase_url and supabase_key),
         "url": supabase_url[:40] + "..." if supabase_url else "(not set)"
     }
+    if supabase_url and supabase_key:
+        try:
+            # Actually test the connection — list buckets
+            resp = requests.get(
+                f"{supabase_url}/storage/v1/bucket",
+                headers={"Authorization": f"Bearer {supabase_key}"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                buckets = [b["name"] for b in resp.json()]
+                has_imagefx = "imagefx" in buckets
+                results["supabase_storage"]["connection"] = "ok"
+                results["supabase_storage"]["buckets"] = buckets
+                results["supabase_storage"]["imagefx_bucket"] = "exists" if has_imagefx else "MISSING — create bucket 'imagefx' (public)"
+                
+                # If bucket exists, count files
+                if has_imagefx:
+                    try:
+                        files_resp = requests.post(
+                            f"{supabase_url}/storage/v1/object/list/{IMAGEFX_BUCKET}",
+                            headers={"Authorization": f"Bearer {supabase_key}", "Content-Type": "application/json"},
+                            json={"limit": 1, "offset": 0, "prefix": ""},
+                            timeout=10
+                        )
+                        if files_resp.status_code == 200:
+                            results["supabase_storage"]["files_sample"] = len(files_resp.json())
+                    except:
+                        pass
+            else:
+                results["supabase_storage"]["connection"] = f"error: {resp.status_code} {resp.text[:100]}"
+        except requests.exceptions.ConnectionError as e:
+            results["supabase_storage"]["connection"] = f"DNS/network error: {str(e)[:100]}"
+        except Exception as e:
+            results["supabase_storage"]["connection"] = f"error: {str(e)[:100]}"
     
     # 4. Disk space
     try:
@@ -1179,6 +1213,44 @@ os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 IMAGEFX_BUCKET = "imagefx"
+
+def ensure_supabase_bucket():
+    """Create imagefx bucket in Supabase Storage if it doesn't exist."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return False
+    try:
+        # Check if bucket exists
+        resp = requests.get(
+            f"{SUPABASE_URL}/storage/v1/bucket/{IMAGEFX_BUCKET}",
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            print(f"[ImageFX] Supabase bucket '{IMAGEFX_BUCKET}' exists")
+            return True
+        
+        # Create bucket
+        resp = requests.post(
+            f"{SUPABASE_URL}/storage/v1/bucket",
+            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"},
+            json={"id": IMAGEFX_BUCKET, "name": IMAGEFX_BUCKET, "public": True},
+            timeout=10
+        )
+        if resp.status_code in (200, 201):
+            print(f"[ImageFX] Created Supabase bucket '{IMAGEFX_BUCKET}' (public)")
+            return True
+        else:
+            print(f"[ImageFX] Failed to create bucket: {resp.status_code} {resp.text[:200]}")
+            return False
+    except Exception as e:
+        print(f"[ImageFX] Bucket check error: {e}")
+        return False
+
+# Try to create bucket on startup
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    ensure_supabase_bucket()
+else:
+    print("[ImageFX] Supabase Storage not configured — images will be local only")
 
 
 def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
