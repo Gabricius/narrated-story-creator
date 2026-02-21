@@ -765,33 +765,8 @@ def process_video_queue():
                             segments=segments, font_size=80, output_path=subtitle_path,
                         )
                     
-                    # Trim bg video to remove trailing frozen frames for clean loop
-                    # FFmpeg stream_loop can stutter if the last frames are duplicated
-                    try:
-                        import subprocess as sp_trim
-                        probe = sp_trim.run([
-                            "ffprobe", "-v", "error",
-                            "-show_entries", "format=duration",
-                            "-of", "csv=p=0", bg_video_path
-                        ], capture_output=True, text=True, timeout=10)
-                        if probe.returncode == 0:
-                            bg_dur = float(probe.stdout.strip())
-                            trim_dur = bg_dur - 0.5  # Remove last 0.5s
-                            if trim_dur > 1:
-                                trimmed_path = os.path.join(video_dir, "bg_trimmed.mp4")
-                                trim_result = sp_trim.run([
-                                    "ffmpeg", "-y",
-                                    "-i", bg_video_path,
-                                    "-t", str(trim_dur),
-                                    "-c", "copy",  # No re-encode, instant
-                                    "-an",
-                                    trimmed_path
-                                ], capture_output=True, text=True, timeout=30)
-                                if trim_result.returncode == 0 and os.path.exists(trimmed_path):
-                                    bg_video_path = trimmed_path
-                                    print(f"[BG] Trimmed to {trim_dur:.1f}s for clean loop")
-                    except Exception as e:
-                        print(f"[BG] Trim skipped: {e}")
+                    # Background video loop is handled by concat demuxer in render_video
+                    # No pre-trimming needed
                     
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
