@@ -722,38 +722,59 @@ def format_time(seconds):
 def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video_path, output_path):
     """
     Renders a video with the given sound, subtitle, overlay image, and a background video.
-    Captures and processes ffmpeg output to track progress.
-    
-    Args:
-        sound_path (str): Path to the audio file
-        subtitle_path (str): Path to the ASS subtitle file
-        overlay_path (str): Path to the overlay PNG image
-        audio_length (float): Length of the audio in seconds
-        bg_video_path (str): Path to the background video that will loop
-        output_path (str): Path where the output video will be saved
-        
-    Returns:
-        boolean: success of the video creation
+    Uses concat demuxer for seamless background looping (no stream_loop stutter).
     """
     
     try:
-        cmd = [
-            'ffmpeg', '-y'
-        ]
+        # ── Pre-loop background using concat demuxer ──
+        # This avoids stream_loop's known freeze/stutter at loop boundaries
+        bg_duration = 0
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", bg_video_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0:
+                bg_duration = float(probe.stdout.strip())
+        except:
+            bg_duration = 30  # fallback assumption
+        
+        if bg_duration <= 0:
+            bg_duration = 30
+        
+        # Calculate loops needed (add 1 extra for safety)
+        loops_needed = int(audio_length / bg_duration) + 2
+        
+        # Create concat list file
+        concat_list_path = os.path.join(os.path.dirname(output_path), "bg_concat_list.txt")
+        if not os.path.dirname(output_path):
+            concat_list_path = os.path.join(os.path.dirname(bg_video_path), "bg_concat_list.txt")
+        
+        with open(concat_list_path, 'w') as f:
+            for _ in range(loops_needed):
+                # Use absolute path and escape single quotes
+                safe_path = os.path.abspath(bg_video_path).replace("'", "'\\''")
+                f.write(f"file '{safe_path}'\n")
+        
+        print(f"[BG] Loop: {bg_duration:.1f}s × {loops_needed} = {bg_duration * loops_needed:.0f}s (need {audio_length:.0f}s)")
+        
+        # ── Build FFmpeg command ──
+        cmd = ['ffmpeg', '-y']
         
         if CUDA:
             cmd.extend(['-hwaccel', 'cuda'])
         
         cmd.extend([
-            '-stream_loop', '-1',
+            '-f', 'concat', '-safe', '0',
             '-t', str(audio_length),
-            '-i', bg_video_path,
+            '-i', concat_list_path,
             '-i', overlay_path,
             '-i', sound_path,
             '-filter_complex', f"[0:v]scale=1920:1080[scaled];[scaled][1:v]overlay=format=auto[overlaid];[overlaid]subtitles={subtitle_path}[v]",
             '-map', '[v]',
             '-map', '2:a',
-            '-c:v',  'h264_nvenc' if CUDA else 'libx264',
+            '-c:v', 'h264_nvenc' if CUDA else 'libx264',
             '-preset', 'fast' if CUDA else 'ultrafast',
             '-crf', '23',
             '-c:a', 'aac',
@@ -824,6 +845,14 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
         
         # Wait for the process to complete and check the return code
         return_code = process.wait()
+        
+        # Cleanup concat list
+        try:
+            if os.path.exists(concat_list_path):
+                os.remove(concat_list_path)
+        except:
+            pass
+        
         if return_code != 0:
             print(f"ffmpeg exited with code: {return_code}")
             return False
@@ -832,4 +861,10 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
         
     except Exception as e:
         print(f"Error during video rendering: {e}")
+        # Cleanup on error too
+        try:
+            if 'concat_list_path' in dir() and os.path.exists(concat_list_path):
+                os.remove(concat_list_path)
+        except:
+            pass
         return False
