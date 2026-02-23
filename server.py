@@ -1274,10 +1274,22 @@ def imagefx_get_token(cookie: str) -> dict:
     Returns: { "access_token": "ya29...", "expires": "...", "user": {...} }
     Raises: Exception on failure
     """
-    headers = {**IMAGEFX_DEFAULT_HEADERS, "Cookie": cookie}
+    # Sanitize cookie: remove newlines, collapse spaces, trim
+    cookie = cookie.replace("\r", "").replace("\n", " ").strip()
+    cookie = re.sub(r'\s+', ' ', cookie)
+    
+    # Don't send Content-Type on GET — some servers reject it
+    headers = {
+        "Origin": "https://labs.google",
+        "Referer": "https://labs.google/fx/tools/image-fx",
+        "Cookie": cookie,
+    }
+    
+    print(f"[ImageFX] Token exchange — cookie length: {len(cookie)} chars, first 80: {cookie[:80]}...")
     resp = requests.get(IMAGEFX_SESSION_URL, headers=headers, timeout=15)
     
     if not resp.ok:
+        print(f"[ImageFX] Session failed: HTTP {resp.status_code} — {resp.text[:300]}")
         raise Exception(f"Session auth failed (HTTP {resp.status_code}): {resp.text[:300]}")
     
     data = resp.json()
@@ -1294,7 +1306,8 @@ def generate_imagefx(req: dict):
     Body: { "cookie": "<session cookie header string>", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
     The "cookie" field should be the full cookie header string from labs.google (via Cookie Editor → Export → Header String).
     """
-    cookie = req.get("cookie", "").strip()
+    cookie = req.get("cookie", "").replace("\r", "").replace("\n", " ").strip()
+    cookie = re.sub(r'\s+', ' ', cookie)
     prompt = req.get("prompt", "").strip()
     aspect_ratio = req.get("aspect_ratio", "PORTRAIT").upper()
     num_images = req.get("num_images", 4)
@@ -1431,7 +1444,8 @@ def test_imagefx_token(req: dict):
     Body: { "cookie": "<session cookie header string>" }
     Returns: { "valid": true/false, "message": "...", "user": "..." }
     """
-    cookie = req.get("cookie", "").strip()
+    cookie = req.get("cookie", "").replace("\r", "").replace("\n", " ").strip()
+    cookie = re.sub(r'\s+', ' ', cookie)
     if not cookie:
         return JSONResponse(content={"valid": False, "message": "Cookie vazio"}, status_code=400)
     
