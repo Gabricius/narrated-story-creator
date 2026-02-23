@@ -22,6 +22,81 @@ import random
 import re
 import torch
 
+def normalize_text_for_tts(text: str) -> str:
+    """Normalize text for TTS: convert symbols, currencies, and special chars to spoken words.
+    
+    Without this, TTS models like Kokoro choke on $12,000, €500, 50%, etc.
+    causing audio to freeze and desync all subtitles.
+    """
+    import re as _re
+    
+    # ── Currency: $12,000 → "12,000 dollars", €500 → "500 euros", etc. ──
+    # Handle currency BEFORE the number (most common: $100, €50, £30, R$500)
+    # Pattern: optional R followed by currency symbol, optional space, then number with optional commas/decimals
+    def currency_to_words(match):
+        prefix = match.group(1) or ''  # R for R$
+        symbol = match.group(2)
+        number = match.group(3)
+        
+        currency_names = {
+            '$': 'dollars' if not prefix else 'reais',
+            '€': 'euros',
+            '£': 'pounds',
+            '¥': 'yen',
+        }
+        currency = currency_names.get(symbol, 'dollars')
+        
+        # Clean number: remove commas for readability but keep decimal
+        # $12,000 → "12000", $12,000.50 → "12000.50"
+        clean_num = number.replace(',', '')
+        
+        try:
+            val = float(clean_num)
+            if val == 1:
+                # Singular
+                singular = {'dollars': 'dollar', 'euros': 'euro', 'pounds': 'pound', 
+                           'yen': 'yen', 'reais': 'real'}
+                currency = singular.get(currency, currency)
+        except:
+            pass
+        
+        return f"{number} {currency}"
+    
+    # R$ must come before plain $
+    text = _re.sub(r'(R)\$([\d,]+\.?\d*)', currency_to_words, text)
+    text = _re.sub(r'()([$€£¥])\s?([\d,]+\.?\d*)', currency_to_words, text)
+    
+    # Currency AFTER number: 100$ → "100 dollars" (less common but seen)
+    text = _re.sub(r'([\d,]+\.?\d*)\s?[$]', r'\1 dollars', text)
+    text = _re.sub(r'([\d,]+\.?\d*)\s?[€]', r'\1 euros', text)
+    text = _re.sub(r'([\d,]+\.?\d*)\s?[£]', r'\1 pounds', text)
+    
+    # ── Percent ──
+    text = _re.sub(r'(\d+\.?\d*)\s?%', r'\1 percent', text)
+    
+    # ── Common symbols ──
+    text = text.replace(' & ', ' and ')
+    text = text.replace('&', ' and ')
+    text = _re.sub(r'#(\d+)', r'number \1', text)  # #1 → "number 1"
+    text = text.replace('#', '')  # standalone #
+    text = text.replace('@', ' at ')
+    text = text.replace('…', '...')
+    text = text.replace('—', ', ')  # em dash → pause
+    text = text.replace('–', ', ')  # en dash → pause
+    text = text.replace('"', '"').replace('"', '"')  # smart quotes → regular
+    text = text.replace(''', "'").replace(''', "'")
+    
+    # ── Standalone symbols that confuse TTS ──
+    text = text.replace('*', '')   # markdown bold/italic artifacts
+    text = text.replace('~', '')   # markdown strikethrough
+    text = text.replace('`', '')   # code backticks
+    text = text.replace('^', '')
+    
+    # ── Collapse multiple spaces ──
+    text = _re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
 def normalize_drive_url(url: str) -> str:
     """Convert Google Drive share/view links to direct download URLs.
     
@@ -323,6 +398,70 @@ os.makedirs(TMP_DIR, exist_ok=True)
 VIDEOS_DIR = os.path.join(WORK_DIR, "videos")
 os.makedirs(VIDEOS_DIR, exist_ok=True)
 SHELVE_FILE_PATH = os.path.join(WORK_DIR, "videos_db")
+
+# ── Subscribe overlay cache ──
+# Green-screen subscribe overlay videos are downloaded once and reused across renders
+SUBSCRIBE_CACHE_DIR = os.path.join(WORK_DIR, "subscribe_cache")
+os.makedirs(SUBSCRIBE_CACHE_DIR, exist_ok=True)
+
+def get_cached_subscribe_overlay(url: str = None, drive_folder_id: str = None, drive_filename: str = None) -> str:
+    """Download subscribe overlay video, cache locally. Returns local path or None.
+    
+    Supports two modes:
+    - url: Direct HTTP/Drive URL download
+    - drive_folder_id + drive_filename: Download via rclone (more reliable for Drive)
+    """
+    if not url and not (drive_folder_id and drive_filename):
+        return None
+    
+    import hashlib
+    cache_key = url or f"{drive_folder_id}/{drive_filename}"
+    url_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+    ext = os.path.splitext(drive_filename or url or ".mp4")[1] or ".mp4"
+    cached_path = os.path.join(SUBSCRIBE_CACHE_DIR, f"subscribe_{url_hash}{ext}")
+    
+    if os.path.exists(cached_path) and os.path.getsize(cached_path) > 1000:
+        print(f"[SUB-OVERLAY] Using cached: {cached_path} ({os.path.getsize(cached_path) / 1024:.0f} KB)")
+        return cached_path
+    
+    # Method 1: rclone (preferred for Drive folders)
+    if drive_folder_id and drive_filename and rclone_available():
+        try:
+            print(f"[SUB-OVERLAY] Downloading via rclone: {drive_filename} from folder {drive_folder_id}")
+            result = subprocess.run([
+                "rclone", "copyto",
+                f"{RCLONE_REMOTE}:{drive_filename}",
+                cached_path,
+                "--drive-root-folder-id", drive_folder_id,
+            ], capture_output=True, text=True, timeout=120)
+            
+            if os.path.exists(cached_path) and os.path.getsize(cached_path) > 1000:
+                print(f"[SUB-OVERLAY] Cached via rclone: {os.path.getsize(cached_path) / 1024:.0f} KB")
+                return cached_path
+            else:
+                print(f"[SUB-OVERLAY] Rclone copyto failed: {result.stderr[-200:]}")
+        except Exception as e:
+            print(f"[SUB-OVERLAY] Rclone error: {e}")
+    
+    # Method 2: HTTP download (for direct URLs)
+    if url:
+        try:
+            download_url = normalize_drive_url(url)
+            print(f"[SUB-OVERLAY] Downloading via HTTP: {download_url[:80]}...")
+            resp = requests.get(download_url, stream=True, timeout=60, allow_redirects=True)
+            if resp.status_code == 200:
+                with open(cached_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                size = os.path.getsize(cached_path)
+                print(f"[SUB-OVERLAY] Cached via HTTP: {size / 1024:.0f} KB")
+                return cached_path
+            else:
+                print(f"[SUB-OVERLAY] HTTP download failed: {resp.status_code}")
+        except Exception as e:
+            print(f"[SUB-OVERLAY] HTTP error: {e}")
+    
+    return None
 
 ## Video storage — rclone uploads to Google Drive from VPS
 ## After rendering, rclone copies the video to Drive and returns a public URL
@@ -677,26 +816,34 @@ def process_video_queue():
                     sound_path = os.path.join(video_dir, "sound.wav")
                     segments = []
                     is_international = LANGUAGE_VOICE_MAP[data["voice"]]["international"]
-                    text_len = len(data["text"])
+                    
+                    # Normalize text: $12,000 → "12,000 dollars", 50% → "50 percent", etc.
+                    # Without this, TTS freezes on symbols and desyncs all subtitles
+                    tts_text = normalize_text_for_tts(data["text"])
+                    if tts_text != data["text"]:
+                        diff = len(data["text"]) - len(tts_text)
+                        print(f"[TTS] Text normalized ({diff:+d} chars)")
+                    
+                    text_len = len(tts_text)
                     use_chunked = text_len > TTS_CHUNK_CHARS
                     
                     if use_chunked:
                         print(f"[TTS] Large text ({text_len} chars), using chunked processing")
                         captions, audio_length = create_tts_chunked(
-                            text=data["text"], output_path=sound_path,
+                            text=tts_text, output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                             is_international=is_international,
                         )
                     elif is_international:
                         captions, audio_length = create_tts_international(
-                            text=data["text"], output_path=sound_path,
+                            text=tts_text, output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                         )
                     else:
                         captions, audio_length = create_tts_english(
-                            text=data["text"], output_path=sound_path,
+                            text=tts_text, output_path=sound_path,
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                         )
@@ -768,12 +915,28 @@ def process_video_queue():
                     # Background video loop is handled by concat demuxer in render_video
                     # No pre-trimming needed
                     
+                    # Download subscribe overlay if provided (green-screen video)
+                    subscribe_overlay_local = None
+                    sub_overlay_url = data.get("subscribe_overlay_url")
+                    sub_overlay_folder = data.get("subscribe_overlay_drive_folder")
+                    sub_overlay_file = data.get("subscribe_overlay_filename", "overlay-subscribe-new.mp4")
+                    
+                    if sub_overlay_url or sub_overlay_folder:
+                        subscribe_overlay_local = get_cached_subscribe_overlay(
+                            url=sub_overlay_url,
+                            drive_folder_id=sub_overlay_folder,
+                            drive_filename=sub_overlay_file,
+                        )
+                    
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
                     render_video(
                         sound_path=sound_path, subtitle_path=subtitle_path,
                         overlay_path=overlay_path, audio_length=audio_length,
                         bg_video_path=bg_video_path, output_path=video_path,
+                        subscribe_overlay_path=subscribe_overlay_local,
+                        subscribe_first_at=data.get("subscribe_first_at", 30),
+                        subscribe_interval=data.get("subscribe_interval", 180),
                     )
                     
                     try:
@@ -854,7 +1017,12 @@ def create_video(video: dict):
         voice=voice,
         overlay_bg_color=overlay_bg_color,
         version=version,
-        gdrive_folder_id=video.get("gdrive_folder_id", "")
+        gdrive_folder_id=video.get("gdrive_folder_id", ""),
+        subscribe_overlay_url=video.get("subscribe_overlay_url", ""),
+        subscribe_overlay_drive_folder=video.get("subscribe_overlay_drive_folder", ""),
+        subscribe_overlay_filename=video.get("subscribe_overlay_filename", "overlay-subscribe-new.mp4"),
+        subscribe_first_at=int(video.get("subscribe_first_at", 30)),
+        subscribe_interval=int(video.get("subscribe_interval", 180)),
     )
     
     if error:
@@ -1158,7 +1326,12 @@ def create_test_video(params: dict = {}):
         bg_video_url=bg_video_url,
         voice=voice,
         version="v2",
-        gdrive_folder_id=gdrive_folder_id
+        gdrive_folder_id=gdrive_folder_id,
+        subscribe_overlay_url=params.get("subscribe_overlay_url", ""),
+        subscribe_overlay_drive_folder=params.get("subscribe_overlay_drive_folder", ""),
+        subscribe_overlay_filename=params.get("subscribe_overlay_filename", "overlay-subscribe-new.mp4"),
+        subscribe_first_at=int(params.get("subscribe_first_at", 30)),
+        subscribe_interval=int(params.get("subscribe_interval", 180)),
     )
     
     if error:
@@ -1562,7 +1735,10 @@ async def handle_sse(request: Request):
 def process_video_request(
     text: str, person_image_url: str, person_name: str, bg_video_url: str,
     voice: str = "af_heart", overlay_bg_color: tuple = (232, 14, 64), version: str = "v1",
-    gdrive_folder_id: str = ""
+    gdrive_folder_id: str = "",
+    subscribe_overlay_url: str = "", subscribe_overlay_drive_folder: str = "",
+    subscribe_overlay_filename: str = "overlay-subscribe-new.mp4",
+    subscribe_first_at: int = 30, subscribe_interval: int = 180,
 ) -> tuple[str, dict, str]:
     """Process video creation request."""
     if not text:
@@ -1621,6 +1797,11 @@ def process_video_request(
             "overlay_bg_color": overlay_bg_color, "person_image_url": person_image_url,
             "bg_video_url": bg_video_url, "version": version,
             "gdrive_folder_id": gdrive_folder_id,
+            "subscribe_overlay_url": subscribe_overlay_url,
+            "subscribe_overlay_drive_folder": subscribe_overlay_drive_folder,
+            "subscribe_overlay_filename": subscribe_overlay_filename,
+            "subscribe_first_at": subscribe_first_at,
+            "subscribe_interval": subscribe_interval,
         },
         "created_at": time.time()
     }
