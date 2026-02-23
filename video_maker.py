@@ -719,10 +719,15 @@ def format_time(seconds):
     
     return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
-def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video_path, output_path):
+def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video_path, output_path,
+                 subscribe_overlay_path=None, subscribe_first_at=30, subscribe_interval=180):
     """
     Renders a video with the given sound, subtitle, overlay image, and a background video.
     Uses concat demuxer for seamless background looping (no stream_loop stutter).
+    
+    Optional subscribe_overlay_path: a green-screen video overlaid periodically.
+    First appearance at subscribe_first_at seconds, then every subscribe_interval seconds.
+    Green is removed via chromakey.
     """
     
     try:
@@ -765,15 +770,72 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
         if CUDA:
             cmd.extend(['-hwaccel', 'cuda'])
         
+        # Input 0: background video (looped via concat)
         cmd.extend([
             '-f', 'concat', '-safe', '0',
             '-t', str(audio_length),
             '-i', concat_list_path,
-            '-i', overlay_path,
-            '-i', sound_path,
-            '-filter_complex', f"[0:v]scale=1920:1080[scaled];[scaled][1:v]overlay=format=auto[overlaid];[overlaid]subtitles={subtitle_path}[v]",
+        ])
+        
+        # Input 1: person/channel overlay image
+        cmd.extend(['-i', overlay_path])
+        
+        # Input 2: audio
+        cmd.extend(['-i', sound_path])
+        
+        # Input 3 (optional): subscribe overlay video with green screen
+        has_sub_overlay = subscribe_overlay_path and os.path.exists(subscribe_overlay_path)
+        if has_sub_overlay:
+            # Probe subscribe overlay duration
+            sub_dur = 5.0  # fallback
+            try:
+                probe_sub = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", subscribe_overlay_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                if probe_sub.returncode == 0:
+                    sub_dur = float(probe_sub.stdout.strip())
+            except:
+                pass
+            
+            print(f"[SUB-OVERLAY] Duration: {sub_dur:.1f}s | First at: {subscribe_first_at}s | Every: {subscribe_interval}s")
+            
+            # Loop the subscribe overlay enough times to cover the whole video
+            # Each appearance needs sub_dur seconds, total appearances:
+            num_appearances = int((audio_length - subscribe_first_at) / subscribe_interval) + 2
+            total_sub_needed = num_appearances * sub_dur + subscribe_first_at
+            sub_loops = max(1, int(total_sub_needed / sub_dur) + 2)
+            
+            cmd.extend([
+                '-stream_loop', str(sub_loops),
+                '-i', subscribe_overlay_path,
+            ])
+            
+            # ── Filter with subscribe overlay ──
+            # Chromakey: remove green (#00FF00), similarity=0.3, blend=0.15
+            # Enable: show at subscribe_first_at, then every subscribe_interval for sub_dur seconds
+            # The \, escapes commas inside FFmpeg filter expressions
+            esc = "\\,"  # escaped comma for FFmpeg expression
+            enable_expr = f"gte(t{esc}{subscribe_first_at})*lt(mod(t-{subscribe_first_at}{esc}{subscribe_interval}){esc}{sub_dur})"
+            
+            filter_complex = (
+                f"[0:v]scale=1920:1080[scaled];"
+                f"[scaled][1:v]overlay=format=auto[with_person];"
+                f"[3:v]colorkey=0x00FF00:0.3:0.15,format=rgba[subkey];"
+                f"[with_person][subkey]overlay=(W-w)/2:(H-h)/2:format=auto:enable='{enable_expr}'[with_sub];"
+                f"[with_sub]subtitles={subtitle_path}[v]"
+            )
+            audio_map = '2:a'
+        else:
+            # ── Filter without subscribe overlay (original) ──
+            filter_complex = f"[0:v]scale=1920:1080[scaled];[scaled][1:v]overlay=format=auto[overlaid];[overlaid]subtitles={subtitle_path}[v]"
+            audio_map = '2:a'
+        
+        cmd.extend([
+            '-filter_complex', filter_complex,
             '-map', '[v]',
-            '-map', '2:a',
+            '-map', audio_map,
             '-c:v', 'h264_nvenc' if CUDA else 'libx264',
             '-preset', 'fast' if CUDA else 'ultrafast',
             '-crf', '23',
