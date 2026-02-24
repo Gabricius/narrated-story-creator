@@ -30,46 +30,67 @@ def normalize_text_for_tts(text: str) -> str:
     """
     import re as _re
     
-    # ── Currency: $12,000 → "12,000 dollars", €500 → "500 euros", etc. ──
-    # Handle currency BEFORE the number (most common: $100, €50, £30, R$500)
-    # Pattern: optional R followed by currency symbol, optional space, then number with optional commas/decimals
-    def currency_to_words(match):
-        prefix = match.group(1) or ''  # R for R$
+    # Number pattern: proper comma-separated groups + optional decimal (NO trailing commas)
+    # Matches: 12,000  |  1,234,567  |  20  |  1.2  |  3,500.50
+    # Does NOT match: 20, (trailing comma)
+    _NUM = r'\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?'
+    
+    # ── Currency with magnitude: $1.2 million → "1.2 million dollars" ──
+    _MAGNITUDES = r'(?:million|billion|trillion|thousand|hundred|mil|milhão|milhões|bilhão|bilhões)'
+    
+    def currency_magnitude(match):
+        prefix = match.group(1) or ''
         symbol = match.group(2)
         number = match.group(3)
-        
-        currency_names = {
-            '$': 'dollars' if not prefix else 'reais',
-            '€': 'euros',
-            '£': 'pounds',
-            '¥': 'yen',
-        }
-        currency = currency_names.get(symbol, 'dollars')
-        
-        # Clean number: remove commas for readability but keep decimal
-        # $12,000 → "12000", $12,000.50 → "12000.50"
-        clean_num = number.replace(',', '')
-        
+        magnitude = match.group(4)
+        names = {'$': 'dollars' if not prefix else 'reais', '€': 'euros', '£': 'pounds', '¥': 'yen'}
+        return f"{number} {magnitude} {names.get(symbol, 'dollars')}"
+    
+    # R$ magnitude first, then other currencies
+    text = _re.sub(r'(R)([$])\s?(' + _NUM + r')\s+(' + _MAGNITUDES + r')', currency_magnitude, text, flags=_re.IGNORECASE)
+    text = _re.sub(r'()([$€£¥])\s?(' + _NUM + r')\s+(' + _MAGNITUDES + r')', currency_magnitude, text, flags=_re.IGNORECASE)
+    
+    # ── Currency with K/M/B abbreviation: $50K → "50 thousand dollars" ──
+    _ABBREVS = {'k': 'thousand', 'K': 'thousand', 'm': 'million', 'M': 'million', 'b': 'billion', 'B': 'billion'}
+    def currency_abbrev(match):
+        prefix = match.group(1) or ''
+        symbol = match.group(2)
+        number = match.group(3)
+        abbrev = match.group(4)
+        names = {'$': 'dollars' if not prefix else 'reais', '€': 'euros', '£': 'pounds', '¥': 'yen'}
+        magnitude = _ABBREVS.get(abbrev, abbrev)
+        return f"{number} {magnitude} {names.get(symbol, 'dollars')}"
+    
+    text = _re.sub(r'(R)([$])\s?(' + _NUM + r')([kKmMbB])\b', currency_abbrev, text)
+    text = _re.sub(r'()([$€£¥])\s?(' + _NUM + r')([kKmMbB])\b', currency_abbrev, text)
+    
+    # ── Regular currency: $12,000 → "12,000 dollars" ──
+    def currency_to_words(match):
+        prefix = match.group(1) or ''
+        symbol = match.group(2)
+        number = match.group(3)
+        names = {'$': 'dollars' if not prefix else 'reais', '€': 'euros', '£': 'pounds', '¥': 'yen'}
+        currency = names.get(symbol, 'dollars')
         try:
-            val = float(clean_num)
-            if val == 1:
-                # Singular
-                singular = {'dollars': 'dollar', 'euros': 'euro', 'pounds': 'pound', 
-                           'yen': 'yen', 'reais': 'real'}
+            if float(number.replace(',', '')) == 1:
+                singular = {'dollars': 'dollar', 'euros': 'euro', 'pounds': 'pound', 'yen': 'yen', 'reais': 'real'}
                 currency = singular.get(currency, currency)
-        except:
-            pass
-        
+        except: pass
         return f"{number} {currency}"
     
-    # R$ must come before plain $
-    text = _re.sub(r'(R)\$([\d,]+\.?\d*)', currency_to_words, text)
-    text = _re.sub(r'()([$€£¥])\s?([\d,]+\.?\d*)', currency_to_words, text)
+    text = _re.sub(r'(R)([$])\s?(' + _NUM + r')', currency_to_words, text)
+    text = _re.sub(r'()([$€£¥])\s?(' + _NUM + r')', currency_to_words, text)
     
-    # Currency AFTER number: 100$ → "100 dollars" (less common but seen)
-    text = _re.sub(r'([\d,]+\.?\d*)\s?[$]', r'\1 dollars', text)
-    text = _re.sub(r'([\d,]+\.?\d*)\s?[€]', r'\1 euros', text)
-    text = _re.sub(r'([\d,]+\.?\d*)\s?[£]', r'\1 pounds', text)
+    # Currency AFTER number: 100$ → "100 dollars"
+    text = _re.sub(r'(' + _NUM + r')\s?[$]', r'\1 dollars', text)
+    text = _re.sub(r'(' + _NUM + r')\s?[€]', r'\1 euros', text)
+    text = _re.sub(r'(' + _NUM + r')\s?[£]', r'\1 pounds', text)
+    
+    # ── Clean up any remaining currency symbols not caught by patterns ──
+    text = text.replace('$', ' dollars ')
+    text = text.replace('€', ' euros ')
+    text = text.replace('£', ' pounds ')
+    text = text.replace('¥', ' yen ')
     
     # ── Percent ──
     text = _re.sub(r'(\d+\.?\d*)\s?%', r'\1 percent', text)
@@ -77,19 +98,19 @@ def normalize_text_for_tts(text: str) -> str:
     # ── Common symbols ──
     text = text.replace(' & ', ' and ')
     text = text.replace('&', ' and ')
-    text = _re.sub(r'#(\d+)', r'number \1', text)  # #1 → "number 1"
-    text = text.replace('#', '')  # standalone #
+    text = _re.sub(r'#(\d+)', r'number \1', text)
+    text = text.replace('#', '')
     text = text.replace('@', ' at ')
     text = text.replace('…', '...')
-    text = text.replace('—', ', ')  # em dash → pause
-    text = text.replace('–', ', ')  # en dash → pause
-    text = text.replace('"', '"').replace('"', '"')  # smart quotes → regular
-    text = text.replace(''', "'").replace(''', "'")
+    text = text.replace('—', ', ')
+    text = text.replace('–', ', ')
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    text = text.replace('\u2018', "'").replace('\u2019', "'")
     
     # ── Standalone symbols that confuse TTS ──
-    text = text.replace('*', '')   # markdown bold/italic artifacts
-    text = text.replace('~', '')   # markdown strikethrough
-    text = text.replace('`', '')   # code backticks
+    text = text.replace('*', '')
+    text = text.replace('~', '')
+    text = text.replace('`', '')
     text = text.replace('^', '')
     
     # ── Collapse multiple spaces ──
@@ -1296,7 +1317,7 @@ def create_test_video(params: dict = {}):
     # Each chunk ~1500 chars, so 2 chunks = ~3000 chars, 3 chunks = ~4500 chars
     chunk_texts = [
         # Chunk 1: ~1600 chars
-        "This is the first part of the test video. We need enough text to fill an entire chunk of the text to speech system. The purpose of this test is to verify that the subtitle timestamps are correctly offset when multiple chunks are concatenated together. In addition, we will also test the server's ability to handle monetary amounts such as $20, which represents a modest amount, and also $1.2 million. Just to be sure, we would also have something like, “I have $50,” just to say that we have it. This was a test redirected to monetary amounts and how the server will create subtitles for this. Each chunk processes independently and generates its own set of captions starting from zero seconds. The main process then adjusts the timestamps by adding the cumulative duration of all previous chunks. For example if chunk one is thirty seconds long then all timestamps in chunk two should be offset by thirty seconds. This ensures that the subtitles appear at the correct time in the final concatenated audio. Without this offset correction all subtitles would pile up at the beginning of the video which is exactly the bug we are testing for.",
+        "This is the first part of the test video. We need enough text to fill an entire chunk of the text to speech system. The purpose of this test is to verify that the subtitle timestamps are correctly offset when multiple chunks are concatenated together. Each chunk processes independently and generates its own set of captions starting from zero seconds. The main process then adjusts the timestamps by adding the cumulative duration of all previous chunks. For example if chunk one is thirty seconds long then all timestamps in chunk two should be offset by thirty seconds. This ensures that the subtitles appear at the correct time in the final concatenated audio. Without this offset correction all subtitles would pile up at the beginning of the video which is exactly the bug we are testing for. Let us continue with more text to make sure this chunk is long enough. The quick brown fox jumps over the lazy dog. Testing one two three four five six seven eight nine ten. We are almost at the character limit for this chunk now. Just a few more sentences should do it. The weather today is perfect for testing video generation pipelines.",
         # Chunk 2: ~1600 chars
         "Now we are in the second chunk of the test video. If the subtitle system is working correctly you should see these words appearing after the first chunk has finished. The timestamps should flow naturally from where the first chunk ended. This is the critical test. If you see all the subtitles from both chunks appearing at the very beginning of the video then the timestamp offset is not working. But if the subtitles from this second chunk appear roughly halfway through the video then everything is working perfectly. Let us add some more content to make this chunk substantial enough for a proper test. Remember that the text to speech system processes each chunk in a separate subprocess to avoid memory issues. The subprocess loads the model processes the text and then exits freeing all memory. The parent process reads the generated audio and caption files from disk. It then adjusts the caption timestamps and concatenates all the audio chunks into one final file. This approach allows us to process very long scripts without running out of memory. Even a thirty minute video with over thirty thousand characters can be processed this way.",
         # Chunk 3: ~1600 chars (optional)
