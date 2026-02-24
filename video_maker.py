@@ -352,10 +352,15 @@ def create_subtitle_segments_english(captions: List[Dict], max_length=80, lines=
             "end_ts": segment_end_ts
         })
     
-    # Post-processing to ensure no overlaps by adjusting end times if needed
+    # Post-processing: make subtitles persistent (no gaps between segments)
     for i in range(len(segments) - 1):
-        if segments[i]["end_ts"] >= segments[i+1]["start_ts"]:
-            segments[i]["end_ts"] = segments[i+1]["start_ts"] - 0.05
+        next_start = segments[i+1]["start_ts"]
+        # Extend this segment's end to the next segment's start (fills gap)
+        if next_start > segments[i]["end_ts"]:
+            segments[i]["end_ts"] = next_start
+        # Fix overlaps
+        elif segments[i]["end_ts"] >= next_start:
+            segments[i]["end_ts"] = next_start - 0.01
     
     return segments 
 
@@ -550,6 +555,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     # Position at 67.5% from the top
     pos_y = int(1080 * 0.675)
     
+    # ── Normalize caption keys (handle both 'start'/'end' and 'start_ts'/'end_ts') ──
+    normalized_captions = []
+    for cap in word_captions:
+        if isinstance(cap, dict):
+            s = cap.get("start_ts", cap.get("start", cap.get("s", 0)))
+            e = cap.get("end_ts", cap.get("end", cap.get("e", 0)))
+            t = cap.get("text", cap.get("word", cap.get("w", "")))
+            normalized_captions.append({"start_ts": float(s), "end_ts": float(e), "text": str(t)})
+        elif hasattr(cap, "start_ts"):
+            normalized_captions.append({"start_ts": float(cap.start_ts), "end_ts": float(cap.end_ts), "text": str(getattr(cap, 'text', getattr(cap, 'word', '')))})
+        elif hasattr(cap, "start"):
+            normalized_captions.append({"start_ts": float(cap.start), "end_ts": float(cap.end), "text": str(getattr(cap, 'text', getattr(cap, 'word', '')))})
+        else:
+            print(f"[KARAOKE] WARNING: Unknown caption format: {type(cap).__name__} = {repr(cap)[:100]}")
+    
+    word_captions = normalized_captions
+    
     # Merge punctuation with previous words
     merged_captions = []
     for i, caption in enumerate(word_captions):
@@ -605,6 +627,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     # CRITICAL: Track segment end times to prevent overlap
     segment_end_times = []
     
+    # Pre-process: extend word end times to eliminate gaps (persistent subtitles)
+    # Without this, subtitles disappear during tiny pauses between words
+    for seg_idx, segment_words in enumerate(segments):
+        if not segment_words:
+            continue
+        for w_idx in range(len(segment_words) - 1):
+            # Extend this word's end to the next word's start (within segment)
+            next_start = segment_words[w_idx + 1]["start_ts"]
+            if next_start > segment_words[w_idx]["end_ts"]:
+                segment_words[w_idx]["end_ts"] = next_start
+        
+        # Extend last word of this segment to first word of next segment
+        if seg_idx < len(segments) - 1:
+            next_seg = segments[seg_idx + 1]
+            if next_seg:
+                next_seg_start = next_seg[0]["start_ts"]
+                last_word = segment_words[-1]
+                if next_seg_start > last_word["end_ts"]:
+                    last_word["end_ts"] = next_seg_start
+    
     for seg_idx, segment_words in enumerate(segments):
         if not segment_words:
             continue
@@ -613,12 +655,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         segment_end = segment_words[-1]["end_ts"]
         
         # If this is not the first segment, ensure it starts EXACTLY when previous ends
-        # NO gap, NO overlap - instant transition
         if seg_idx > 0 and segment_end_times:
             previous_end = segment_end_times[-1]
-            # Start exactly at previous end (no gap, no overlap)
             if segment_start < previous_end:
-                # Shift this segment to start right after previous
                 time_shift = previous_end - segment_words[0]["start_ts"]
                 for word_data in segment_words:
                     word_data["start_ts"] += time_shift
@@ -647,14 +686,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if current_line:
             lines.append(current_line)
         
-        # Limit to max_lines
         lines = lines[:max_lines]
         
-        # For each word in the segment, create an event that shows all words
-        # with colors changing based on timing
+        # ── TRANSITION-BASED EVENTS (zero gaps guaranteed) ──
+        # Instead of one event per word, create events based on TRANSITIONS.
+        # Each event spans from one word's start to the next word's start.
+        # This eliminates gaps from breathing pauses or TTS timing artifacts.
+        #
+        # Event 0: segment_start → word[1].start  (word 0 = green)
+        # Event 1: word[1].start → word[2].start  (word 1 = green)
+        # ...
+        # Event N: word[N].start → segment_end    (word N = green)
+        
         for word_idx, current_word in enumerate(segment_words):
-            word_start = current_word["start_ts"]
-            word_end = current_word["end_ts"]
+            # Event start: this word's start_ts
+            event_start = current_word["start_ts"]
+            
+            # Event end: next word's start_ts, or segment_end for last word
+            if word_idx < len(segment_words) - 1:
+                event_end = segment_words[word_idx + 1]["start_ts"]
+            else:
+                event_end = segment_end
+            
+            # Safety: ensure minimum duration
+            if event_end <= event_start:
+                event_end = event_start + 0.05
             
             # Build the multi-line text with color tags
             colored_lines = []
@@ -664,39 +720,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 for word_data in line_words:
                     word_text = word_data["text"]
                     
-                    # Find if this is before, at, or after current word
                     word_index_in_segment = segment_words.index(word_data)
                     
                     if word_index_in_segment < word_idx:
-                        # Words already spoken - gray
                         colored_line += f"{{\\c{COLOR_GRAY}}}{word_text}{{\\c}}"
                     elif word_index_in_segment == word_idx:
-                        # Current word - green
                         colored_line += f"{{\\c{COLOR_GREEN}}}{word_text}{{\\c}}"
                     else:
-                        # Words not yet spoken - white (default)
                         colored_line += f"{{\\c{COLOR_WHITE}}}{word_text}{{\\c}}"
                     
-                    # Add space between words (except last in line)
                     if word_data != line_words[-1]:
                         colored_line += " "
                 
                 colored_lines.append(colored_line)
             
-            # Join lines with \N (line break in ASS)
             formatted_text = "\\N".join(colored_lines)
-            
-            # Position at center
             formatted_text = f"{{\\pos(960,{pos_y})}}" + formatted_text
             
-            # Create the dialogue line for this word's duration
-            start_time = format_time(word_start)
-            end_time = format_time(word_end)
+            start_time = format_time(event_start)
+            end_time = format_time(event_end)
             
             ass_content += f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{formatted_text}\n"
-        
-        # DO NOT add final gray state - this causes overlap
-        # The segment simply ends when the last word ends
         
         # Track this segment's end time
         segment_end_times.append(segment_end)
@@ -801,13 +845,28 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
             
             print(f"[SUB-OVERLAY] Duration: {sub_dur:.1f}s | First at: {subscribe_first_at}s | Every: {subscribe_interval}s")
             
-            # Loop the subscribe overlay enough times to cover the whole video
-            # Each appearance needs sub_dur seconds, total appearances:
-            num_appearances = int((audio_length - subscribe_first_at) / subscribe_interval) + 2
-            total_sub_needed = num_appearances * sub_dur + subscribe_first_at
+            # Align interval to nearest multiple of sub_dur so overlay restarts at frame 0
+            # e.g. sub_dur=5, interval=180: 180%5=0 ✓
+            # e.g. sub_dur=7, interval=180: 180%7=5 → adjust to 182 (26×7)
+            if sub_dur > 0 and (subscribe_interval % sub_dur) > 0.01:
+                adjusted = round(subscribe_interval / sub_dur) * sub_dur
+                if adjusted < sub_dur:
+                    adjusted = sub_dur
+                print(f"[SUB-OVERLAY] Adjusted interval {subscribe_interval}→{adjusted:.0f}s for frame alignment")
+                subscribe_interval = adjusted
+            
+            # itsoffset = first_at: overlay's frame 0 lands at main video t=first_at
+            # At t=first_at → overlay time 0 → frame 0 ✓
+            # At t=first_at+interval → overlay time=interval → interval%sub_dur=0 → frame 0 ✓
+            itsoffset = subscribe_first_at
+            
+            total_sub_needed = audio_length - subscribe_first_at + sub_dur
             sub_loops = max(1, int(total_sub_needed / sub_dur) + 2)
             
+            print(f"[SUB-OVERLAY] itsoffset={itsoffset}s, loops={sub_loops}, interval={subscribe_interval}s")
+            
             cmd.extend([
+                '-itsoffset', str(itsoffset),
                 '-stream_loop', str(sub_loops),
                 '-i', subscribe_overlay_path,
             ])
@@ -815,12 +874,11 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
             # ── Filter with subscribe overlay ──
             # Chromakey: remove green (#00FF00), similarity=0.3, blend=0.15
             # Enable: show at subscribe_first_at, then every subscribe_interval for sub_dur seconds
-            # The \, escapes commas inside FFmpeg filter expressions
             esc = "\\,"  # escaped comma for FFmpeg expression
             enable_expr = f"gte(t{esc}{subscribe_first_at})*lt(mod(t-{subscribe_first_at}{esc}{subscribe_interval}){esc}{sub_dur})"
             
             filter_complex = (
-                f"[0:v]scale=1920:1080[scaled];"
+                f"[0:v]scale=1920:1080,gblur=sigma=2[scaled];"
                 f"[scaled][1:v]overlay=format=auto[with_person];"
                 f"[3:v]colorkey=0x00FF00:0.3:0.15,format=rgba[subkey];"
                 f"[with_person][subkey]overlay=(W-w)/2:(H-h)/2:format=auto:enable='{enable_expr}'[with_sub];"
@@ -828,8 +886,8 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
             )
             audio_map = '2:a'
         else:
-            # ── Filter without subscribe overlay (original) ──
-            filter_complex = f"[0:v]scale=1920:1080[scaled];[scaled][1:v]overlay=format=auto[overlaid];[overlaid]subtitles={subtitle_path}[v]"
+            # ── Filter without subscribe overlay ──
+            filter_complex = f"[0:v]scale=1920:1080,gblur=sigma=2[scaled];[scaled][1:v]overlay=format=auto[overlaid];[overlaid]subtitles={subtitle_path}[v]"
             audio_map = '2:a'
         
         cmd.extend([
@@ -838,7 +896,7 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
             '-map', audio_map,
             '-c:v', 'h264_nvenc' if CUDA else 'libx264',
             '-preset', 'fast' if CUDA else 'ultrafast',
-            '-crf', '23',
+            '-crf', '25',
             '-c:a', 'aac',
             '-b:a', '192k',
             '-pix_fmt', 'yuv420p',
