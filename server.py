@@ -121,21 +121,124 @@ def normalize_text_for_tts(text: str) -> str:
 def normalize_drive_url(url: str) -> str:
     """Convert Google Drive share/view links to direct download URLs.
     
-    Input:  https://drive.google.com/file/d/FILE_ID/view?usp=drive_link
-    Output: https://drive.google.com/uc?export=download&id=FILE_ID&confirm=t
-    
-    The confirm=t parameter helps bypass the virus scan confirmation page for large files.
+    Google changed their download endpoint — the old drive.google.com/uc path
+    returns 404 for many files now. The new endpoint is:
+    https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm=t
     """
     if not url:
         return url
+    
+    # Extract file ID from various Drive URL formats
+    file_id = None
+    
+    # Format: drive.google.com/file/d/FILE_ID/view
     match = re.search(r'drive\.google\.com/file/d/([^/?]+)', url)
     if match:
         file_id = match.group(1)
-        return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-    # Already a uc? link — add confirm=t if missing
-    if 'drive.google.com/uc?' in url and 'confirm=' not in url:
-        return url + ('&' if '?' in url else '?') + 'confirm=t'
+    
+    # Format: drive.google.com/uc?...id=FILE_ID
+    if not file_id:
+        match = re.search(r'drive\.google\.com/uc\?.*?id=([^&]+)', url)
+        if match:
+            file_id = match.group(1)
+    
+    # Format: drive.usercontent.google.com/download?id=FILE_ID
+    if not file_id:
+        match = re.search(r'drive\.usercontent\.google\.com/download\?.*?id=([^&]+)', url)
+        if match:
+            file_id = match.group(1)
+    
+    # Format: lh3.googleusercontent.com/d/FILE_ID
+    if not file_id:
+        match = re.search(r'lh3\.googleusercontent\.com/d/([^/?]+)', url)
+        if match:
+            file_id = match.group(1)
+    
+    if file_id:
+        # New endpoint (2024+): drive.usercontent.google.com
+        return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+    
     return url
+
+
+def download_drive_file(url: str, output_path: str, timeout: int = 60) -> bool:
+    """Download a file from Google Drive with fallback URLs.
+    
+    Tries multiple download endpoints because Google frequently changes them.
+    Returns True on success, raises Exception on failure.
+    """
+    original_url = url
+    
+    # Extract file ID
+    file_id = None
+    for pattern in [
+        r'id=([^&]+)',
+        r'drive\.google\.com/file/d/([^/?]+)',
+        r'lh3\.googleusercontent\.com/d/([^/?]+)',
+    ]:
+        match = re.search(pattern, url)
+        if match:
+            file_id = match.group(1)
+            break
+    
+    # Build list of URLs to try (in order of reliability)
+    urls_to_try = []
+    if file_id:
+        urls_to_try = [
+            f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t",
+            f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t",
+            f"https://lh3.googleusercontent.com/d/{file_id}",
+        ]
+    else:
+        urls_to_try = [url]
+    
+    last_error = None
+    for try_url in urls_to_try:
+        try:
+            print(f"[DOWNLOAD] Trying: {try_url[:80]}...")
+            response = requests.get(try_url, stream=True, timeout=timeout, allow_redirects=True)
+            
+            if response.status_code == 200:
+                # Check if we got an HTML page instead of the actual file (virus scan page)
+                content_type = response.headers.get('Content-Type', '')
+                if 'text/html' in content_type:
+                    # Read first chunk to check
+                    first_chunk = next(response.iter_content(chunk_size=1024), b'')
+                    if b'virus scan' in first_chunk.lower() or b'confirm=' in first_chunk.lower():
+                        print(f"[DOWNLOAD] Got virus scan page, trying next URL...")
+                        last_error = "Got HTML virus scan page instead of file"
+                        continue
+                    # If it's HTML but not a scan page, might still be wrong
+                    if b'<!DOCTYPE' in first_chunk or b'<html' in first_chunk:
+                        print(f"[DOWNLOAD] Got HTML response, trying next URL...")
+                        last_error = "Got HTML response instead of file"
+                        continue
+                    # Write first chunk + rest
+                    with open(output_path, 'wb') as f:
+                        f.write(first_chunk)
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                else:
+                    with open(output_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                
+                size = os.path.getsize(output_path)
+                if size < 100:
+                    print(f"[DOWNLOAD] File too small ({size} bytes), trying next URL...")
+                    last_error = f"Downloaded file too small: {size} bytes"
+                    continue
+                
+                print(f"[DOWNLOAD] Success: {size / 1024:.0f} KB")
+                return True
+            else:
+                last_error = f"HTTP {response.status_code}"
+                print(f"[DOWNLOAD] Failed: HTTP {response.status_code}")
+        except Exception as e:
+            last_error = str(e)
+            print(f"[DOWNLOAD] Error: {e}")
+    
+    raise Exception(f"All download attempts failed for {original_url[:80]} — last error: {last_error}")
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.routing import Mount
@@ -464,21 +567,11 @@ def get_cached_subscribe_overlay(url: str = None, drive_folder_id: str = None, d
         except Exception as e:
             print(f"[SUB-OVERLAY] Rclone error: {e}")
     
-    # Method 2: HTTP download (for direct URLs)
+    # Method 2: HTTP download with fallback URLs (for direct URLs)
     if url:
         try:
-            download_url = normalize_drive_url(url)
-            print(f"[SUB-OVERLAY] Downloading via HTTP: {download_url[:80]}...")
-            resp = requests.get(download_url, stream=True, timeout=60, allow_redirects=True)
-            if resp.status_code == 200:
-                with open(cached_path, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                size = os.path.getsize(cached_path)
-                print(f"[SUB-OVERLAY] Cached via HTTP: {size / 1024:.0f} KB")
-                return cached_path
-            else:
-                print(f"[SUB-OVERLAY] HTTP download failed: {resp.status_code}")
+            download_drive_file(url, cached_path, timeout=60)
+            return cached_path
         except Exception as e:
             print(f"[SUB-OVERLAY] HTTP error: {e}")
     
@@ -779,33 +872,13 @@ def process_video_queue():
                     try:
                         # Download background video
                         print(f"Downloading background video for {video_id}")
-                        download_url = normalize_drive_url(data["bg_video_url"])
-                        bg_extension = os.path.splitext(download_url.split('?')[0])[1]
-                        if not bg_extension or len(bg_extension) > 5:
-                            bg_extension = ".mp4"
-                        bg_video_path = os.path.join(video_dir, f"background{bg_extension}")
-                        response = requests.get(download_url, stream=True, timeout=120, allow_redirects=True)
-                        if response.status_code == 200:
-                            with open(bg_video_path, 'wb') as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    f.write(chunk)
-                        else:
-                            raise Exception(f"Failed to download background video: {response.status_code}")
+                        bg_video_path = os.path.join(video_dir, "background.mp4")
+                        download_drive_file(data["bg_video_url"], bg_video_path, timeout=120)
                         
                         # Download person image
                         print(f"Downloading person image for {video_id}")
-                        person_download_url = normalize_drive_url(data["person_image_url"])
-                        person_extension = os.path.splitext(person_download_url.split('?')[0])[1]
-                        if not person_extension or len(person_extension) > 5:
-                            person_extension = ".png"
-                        person_image_path = os.path.join(video_dir, f"person{person_extension}")
-                        response = requests.get(person_download_url, stream=True, timeout=60, allow_redirects=True)
-                        if response.status_code == 200:
-                            with open(person_image_path, 'wb') as f:
-                                for chunk in response.iter_content(chunk_size=8192):
-                                    f.write(chunk)
-                        else:
-                            raise Exception(f"Failed to download person image: {response.status_code}")
+                        person_image_path = os.path.join(video_dir, "person.png")
+                        download_drive_file(data["person_image_url"], person_image_path, timeout=60)
                     except Exception as download_error:
                         try:
                             shutil.rmtree(video_dir)
