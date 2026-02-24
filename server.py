@@ -20,6 +20,7 @@ import base64
 import json
 import random
 import re
+import shutil
 import torch
 
 def normalize_text_for_tts(text: str) -> str:
@@ -161,27 +162,85 @@ def normalize_drive_url(url: str) -> str:
     return url
 
 
-def download_drive_file(url: str, output_path: str, timeout: int = 60) -> bool:
-    """Download a file from Google Drive with fallback URLs.
-    
-    Tries multiple download endpoints because Google frequently changes them.
-    Returns True on success, raises Exception on failure.
-    """
-    original_url = url
-    
-    # Extract file ID
-    file_id = None
+def extract_drive_file_id(url: str) -> str:
+    """Extract Google Drive file ID from various URL formats."""
+    if not url:
+        return None
     for pattern in [
-        r'id=([^&]+)',
         r'drive\.google\.com/file/d/([^/?]+)',
+        r'drive\.usercontent\.google\.com/download\?.*?id=([^&]+)',
+        r'drive\.google\.com/uc\?.*?id=([^&]+)',
+        r'id=([a-zA-Z0-9_-]{20,})',
         r'lh3\.googleusercontent\.com/d/([^/?]+)',
     ]:
         match = re.search(pattern, url)
         if match:
-            file_id = match.group(1)
-            break
+            return match.group(1)
+    return None
+
+
+def download_drive_file(url: str, output_path: str, timeout: int = 120) -> bool:
+    """Download a file from Google Drive.
     
-    # Build list of URLs to try (in order of reliability)
+    Priority:
+    1. rclone (already authenticated, most reliable)
+    2. HTTP fallback with multiple endpoints
+    
+    Returns True on success, raises Exception on failure.
+    """
+    import subprocess as sp
+    
+    file_id = extract_drive_file_id(url)
+    last_error = None
+    
+    # ── Method 1: rclone (preferred — already authenticated, no URL issues) ──
+    if file_id and rclone_available():
+        try:
+            print(f"[DOWNLOAD] rclone copyto by file ID: {file_id}")
+            # rclone backend copyid copies a file by its Drive ID
+            result = sp.run([
+                "rclone", "backend", "copyid",
+                f"{RCLONE_REMOTE}:",
+                file_id,
+                output_path,
+            ], capture_output=True, text=True, timeout=timeout)
+            
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+                size = os.path.getsize(output_path)
+                print(f"[DOWNLOAD] rclone success: {size / 1024:.0f} KB")
+                return True
+            else:
+                err = result.stderr[-200:] if result.stderr else "unknown"
+                print(f"[DOWNLOAD] rclone copyid failed (rc={result.returncode}): {err}")
+                last_error = f"rclone copyid: {err}"
+                
+                # Fallback: rclone copy with --drive-files-only flag
+                # Create temp dir, copy into it, then move
+                import tempfile
+                tmp_dir = tempfile.mkdtemp()
+                try:
+                    result2 = sp.run([
+                        "rclone", "copy",
+                        f"{RCLONE_REMOTE}:{{{{ {file_id} }}}}",
+                        tmp_dir,
+                    ], capture_output=True, text=True, timeout=timeout)
+                    
+                    # Find any file in tmp_dir
+                    for f in os.listdir(tmp_dir):
+                        tmp_file = os.path.join(tmp_dir, f)
+                        if os.path.getsize(tmp_file) > 100:
+                            shutil.move(tmp_file, output_path)
+                            size = os.path.getsize(output_path)
+                            print(f"[DOWNLOAD] rclone copy fallback success: {size / 1024:.0f} KB")
+                            return True
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                
+        except Exception as e:
+            last_error = str(e)
+            print(f"[DOWNLOAD] rclone error: {e}")
+    
+    # ── Method 2: HTTP with multiple endpoint fallbacks ──
     urls_to_try = []
     if file_id:
         urls_to_try = [
@@ -189,31 +248,22 @@ def download_drive_file(url: str, output_path: str, timeout: int = 60) -> bool:
             f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t",
             f"https://lh3.googleusercontent.com/d/{file_id}",
         ]
-    else:
+    elif url:
         urls_to_try = [url]
     
-    last_error = None
     for try_url in urls_to_try:
         try:
-            print(f"[DOWNLOAD] Trying: {try_url[:80]}...")
+            print(f"[DOWNLOAD] HTTP trying: {try_url[:80]}...")
             response = requests.get(try_url, stream=True, timeout=timeout, allow_redirects=True)
             
             if response.status_code == 200:
-                # Check if we got an HTML page instead of the actual file (virus scan page)
                 content_type = response.headers.get('Content-Type', '')
                 if 'text/html' in content_type:
-                    # Read first chunk to check
                     first_chunk = next(response.iter_content(chunk_size=1024), b'')
-                    if b'virus scan' in first_chunk.lower() or b'confirm=' in first_chunk.lower():
-                        print(f"[DOWNLOAD] Got virus scan page, trying next URL...")
-                        last_error = "Got HTML virus scan page instead of file"
-                        continue
-                    # If it's HTML but not a scan page, might still be wrong
                     if b'<!DOCTYPE' in first_chunk or b'<html' in first_chunk:
-                        print(f"[DOWNLOAD] Got HTML response, trying next URL...")
-                        last_error = "Got HTML response instead of file"
+                        print(f"[DOWNLOAD] Got HTML page, skipping...")
+                        last_error = "Got HTML instead of file"
                         continue
-                    # Write first chunk + rest
                     with open(output_path, 'wb') as f:
                         f.write(first_chunk)
                         for chunk in response.iter_content(chunk_size=8192):
@@ -225,20 +275,20 @@ def download_drive_file(url: str, output_path: str, timeout: int = 60) -> bool:
                 
                 size = os.path.getsize(output_path)
                 if size < 100:
-                    print(f"[DOWNLOAD] File too small ({size} bytes), trying next URL...")
-                    last_error = f"Downloaded file too small: {size} bytes"
+                    last_error = f"File too small: {size} bytes"
+                    print(f"[DOWNLOAD] File too small ({size}B), skipping...")
                     continue
                 
-                print(f"[DOWNLOAD] Success: {size / 1024:.0f} KB")
+                print(f"[DOWNLOAD] HTTP success: {size / 1024:.0f} KB")
                 return True
             else:
                 last_error = f"HTTP {response.status_code}"
-                print(f"[DOWNLOAD] Failed: HTTP {response.status_code}")
+                print(f"[DOWNLOAD] HTTP {response.status_code}")
         except Exception as e:
             last_error = str(e)
-            print(f"[DOWNLOAD] Error: {e}")
+            print(f"[DOWNLOAD] HTTP error: {e}")
     
-    raise Exception(f"All download attempts failed for {original_url[:80]} — last error: {last_error}")
+    raise Exception(f"All download methods failed for {url[:80]} (id={file_id}) — {last_error}")
 from mcp.server.fastmcp import FastMCP
 from mcp.server.sse import SseServerTransport
 from starlette.routing import Mount
