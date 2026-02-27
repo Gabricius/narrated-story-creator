@@ -911,6 +911,7 @@ def process_video_queue():
     while worker_running:
         try:
             if not video_queue.empty():
+                worker_start_time = time.time()
                 video_id = video_queue.get()
                 if video_id in videos:
                     videos[video_id]["status"] = VideoStatus.PROCESSING
@@ -1104,6 +1105,9 @@ def process_video_queue():
                             except:
                                 pass
                     
+                    worker_duration = int(time.time() - worker_start_time)
+                    videos[video_id]["data"]["video_render_duration_seconds"] = worker_duration
+                    videos[video_id]["data"]["video_editing_version"] = data.get("version", "v1")
                     videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
                     gc.collect()
@@ -1181,6 +1185,12 @@ def create_video(video: dict):
 def get_video(video_id: str):
     if video_id in videos:
         result = {"video_id": video_id, "status": videos[video_id]["status"]}
+        vid_data = videos[video_id].get("data", {})
+        if "video_render_duration_seconds" in vid_data:
+            result["video_render_duration_seconds"] = vid_data["video_render_duration_seconds"]
+        if "video_editing_version" in vid_data:
+            result["video_editing_version"] = vid_data["video_editing_version"]
+            
         if videos[video_id]["status"] == VideoStatus.COMPLETED:
             drive_url = videos[video_id].get("drive_url")
             if drive_url:
