@@ -1108,6 +1108,7 @@ def process_video_queue():
                     worker_duration = int(time.time() - worker_start_time)
                     videos[video_id]["data"]["video_render_duration_seconds"] = worker_duration
                     videos[video_id]["data"]["video_editing_version"] = data.get("version", "v1")
+                    videos[video_id]["data"]["video_duration_seconds"] = int(audio_length)
                     videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
                     gc.collect()
@@ -1190,6 +1191,8 @@ def get_video(video_id: str):
             result["video_render_duration_seconds"] = vid_data["video_render_duration_seconds"]
         if "video_editing_version" in vid_data:
             result["video_editing_version"] = vid_data["video_editing_version"]
+        if "video_duration_seconds" in vid_data:
+            result["video_duration_seconds"] = vid_data["video_duration_seconds"]
             
         if videos[video_id]["status"] == VideoStatus.COMPLETED:
             drive_url = videos[video_id].get("drive_url")
