@@ -589,6 +589,7 @@ def get_cached_subscribe_overlay(url: str = None, drive_folder_id: str = None, d
         return None
     
     import hashlib
+    import subprocess
     cache_key = url or f"{drive_folder_id}/{drive_filename}"
     url_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
     ext = os.path.splitext(drive_filename or url or ".mp4")[1] or ".mp4"
