@@ -1093,9 +1093,8 @@ def process_video_queue():
                     
                     # Upload to Google Drive via rclone if available
                     drive_url = None
-                    if rclone_available() and RCLONE_FOLDER_ID:
-                        # Use per-channel folder if specified, otherwise global
-                        folder_id = data.get("gdrive_folder_id") or RCLONE_FOLDER_ID
+                    folder_id = data.get("gdrive_folder_id") or RCLONE_FOLDER_ID
+                    if rclone_available() and folder_id:
                         drive_url = rclone_upload_video(video_path, f"{video_id}.mp4", folder_id=folder_id)
                         if drive_url:
                             videos[video_id]["drive_url"] = drive_url
