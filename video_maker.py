@@ -171,6 +171,52 @@ def create_overlay(
     overlay.save(output_path)
     print(f"Overlay saved to {output_path}")
 
+def create_overlay_v3(
+    person_image_path,
+    output_path,
+    subtitle_background_color=(0, 0, 0, 200),
+    overlay_size=(1920, 1080)
+):
+    """V3 overlay: character image + subtitle black bar only. No colored band, no name, no icon."""
+    overlay = Image.new("RGBA", overlay_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    width, height = overlay_size
+
+    person_image_height_percent = 0.40
+    black_box_height_percent = 0.30
+    bottom_margin_percent = 0.10
+
+    person_image_height_abs = int(height * person_image_height_percent)
+    black_box_height_abs = int(height * black_box_height_percent)
+    bottom_margin_abs = int(height * bottom_margin_percent)
+
+    # Black bar at the same bottom position as v2
+    box_y_start = height - bottom_margin_abs - black_box_height_abs
+    draw.rectangle(
+        [(0, box_y_start), (width, box_y_start + black_box_height_abs)],
+        fill=subtitle_background_color
+    )
+
+    # Person image: bottom edge aligned with the top of the black bar
+    person_y_start = box_y_start - person_image_height_abs
+
+    try:
+        person_img = Image.open(person_image_path).convert("RGBA")
+    except FileNotFoundError as e:
+        raise Exception(f"Cannot open person image: {e}")
+    except Exception as e:
+        raise Exception(f"Cannot open person image resource: {e}")
+
+    person_img_original_width, person_img_original_height = person_img.size
+    person_width_abs = int(person_image_height_abs * person_img_original_width / person_img_original_height)
+
+    person_img_resized = person_img.resize((person_width_abs, person_image_height_abs))
+    overlay.paste(person_img_resized, (15, person_y_start), person_img_resized)
+
+    overlay.save(output_path)
+    print(f"V3 overlay saved to {output_path}")
+
 def create_tts_english(text, output_path, lang_code, voice):
     pipeline = KPipeline(
         lang_code=lang_code,
