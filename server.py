@@ -294,6 +294,7 @@ from mcp.server.sse import SseServerTransport
 from starlette.routing import Mount
 from video_maker import (
     create_overlay,
+    create_overlay_v3,
     create_tts_international,
     create_tts_english,
     create_subtitle_segments_international,
@@ -946,14 +947,21 @@ def process_video_queue():
                     
                     display_name = data.get("person_name") or "Narrator"
                     
-                    create_overlay(
-                        person_image_path=person_image_path,
-                        volume_icon_path="assets/icon_volume.png",
-                        display_name=display_name,
-                        output_path=overlay_path,
-                        subtitle_background_color=(0, 0, 0, 200),
-                        font_path=font_path,
-                    )
+                    if version == "v3":
+                        create_overlay_v3(
+                            person_image_path=person_image_path,
+                            output_path=overlay_path,
+                            subtitle_background_color=(0, 0, 0, 200),
+                        )
+                    else:
+                        create_overlay(
+                            person_image_path=person_image_path,
+                            volume_icon_path="assets/icon_volume.png",
+                            display_name=display_name,
+                            output_path=overlay_path,
+                            subtitle_background_color=(0, 0, 0, 200),
+                            font_path=font_path,
+                        )
                     
                     print("creating narration")
                     # Free memory before heavy TTS processing
@@ -1047,8 +1055,8 @@ def process_video_queue():
                     subtitle_path = os.path.join(video_dir, "subtitle.ass")
                     print(f"Creating subtitle (version: {version})")
                     
-                    if version == "v2":
-                        print("Using v2 karaoke subtitle style")
+                    if version in ("v2", "v3"):
+                        print(f"Using {version} karaoke subtitle style")
                         create_subtitle_v2_karaoke(
                             word_captions=captions, font_size=80, output_path=subtitle_path,
                         )
@@ -1279,12 +1287,10 @@ def upload_local_to_drive(video_id: str = None):
     """Manually upload local video(s) to Google Drive via rclone."""
     if not rclone_available():
         return JSONResponse(content={"error": "rclone not available"}, status_code=503)
-    if not RCLONE_FOLDER_ID:
-        return JSONResponse(content={"error": "GDRIVE_FOLDER_ID not set"}, status_code=503)
-    
+
     results = []
     targets = []
-    
+
     if video_id:
         if video_id in videos:
             targets.append(video_id)
@@ -1292,17 +1298,20 @@ def upload_local_to_drive(video_id: str = None):
             return JSONResponse(content={"error": "Video not found"}, status_code=404)
     else:
         # All local completed videos without drive_url
-        targets = [vid for vid, data in videos.items() 
+        targets = [vid for vid, data in videos.items()
                    if data["status"] == VideoStatus.COMPLETED and not data.get("drive_url")]
-    
+
     for vid in targets:
         video_path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
         if not os.path.exists(video_path):
             results.append({"video_id": vid, "status": "file_missing"})
             continue
-        
+
         size_mb = os.path.getsize(video_path) / 1024 / 1024
         folder_id = videos[vid].get("data", {}).get("gdrive_folder_id") or RCLONE_FOLDER_ID
+        if not folder_id:
+            results.append({"video_id": vid, "status": "no_folder_id"})
+            continue
         drive_url = rclone_upload_video(video_path, f"{vid}.mp4", folder_id=folder_id)
         if drive_url:
             videos[vid]["drive_url"] = drive_url
@@ -1445,6 +1454,7 @@ def create_test_video(params: dict = {}):
     person_image_url = params.get("person_image_url", "")
     voice = params.get("voice", "af_heart")
     num_chunks = int(params.get("chunks", 2))
+    version = params.get("version", "v2")
     
     if not bg_video_url:
         return JSONResponse(content={"error": "bg_video_url is required"}, status_code=400)
@@ -1482,7 +1492,7 @@ def create_test_video(params: dict = {}):
         person_name="Test",
         bg_video_url=bg_video_url,
         voice=voice,
-        version="v2",
+        version=version,
         gdrive_folder_id=gdrive_folder_id,
         subscribe_overlay_url=params.get("subscribe_overlay_url", ""),
         subscribe_overlay_drive_folder=params.get("subscribe_overlay_drive_folder", ""),
