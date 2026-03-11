@@ -946,7 +946,8 @@ def process_video_queue():
                         font_path = "assets/noto_hindi.ttf"
                     
                     display_name = data.get("person_name") or "Narrator"
-                    
+                    version = data.get("version", "v2")
+
                     if version == "v3":
                         create_overlay_v3(
                             person_image_path=person_image_path,
@@ -1051,7 +1052,6 @@ def process_video_queue():
                             captions=captions, max_length=30, lines=2
                         )
                     
-                    version = data.get("version", "v1")
                     subtitle_path = os.path.join(video_dir, "subtitle.ass")
                     print(f"Creating subtitle (version: {version})")
                     
