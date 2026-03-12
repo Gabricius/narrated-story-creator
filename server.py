@@ -362,7 +362,7 @@ def concatenate_wav_files(wav_paths, output_path):
         except:
             pass
 
-def create_tts_chunked(text, output_path, lang_code, voice, is_international=False):
+def create_tts_chunked(text, output_path, lang_code, voice, is_international=False, production_id=None):
     """Process TTS in isolated subprocesses to avoid OOM.
     
     Each chunk runs in a separate Python process that loads the model,
@@ -506,8 +506,14 @@ print(f"CHUNK_OK audio_length={{audio_length:.2f}} captions={{len(serializable)}
             all_captions.extend(adjusted_captions)
             chunk_wav_paths.append(chunk_path)
             cumulative_duration += audio_length
-            
+
             print(f"[TTS] Chunk {i+1} done: {audio_length:.1f}s (total: {cumulative_duration:.1f}s) | Memory: {get_memory_mb():.0f} MB")
+            update_production_progress(production_id, {
+                "stage": "tts",
+                "chunk": i + 1,
+                "total_chunks": total_chunks,
+                "elapsed_s": round(cumulative_duration, 1),
+            })
             
         except sp.TimeoutExpired:
             print(f"[TTS] Chunk {i+1} timed out after 600s")
@@ -989,6 +995,7 @@ def process_video_queue():
                             lang_code=LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"],
                             voice=data["voice"],
                             is_international=is_international,
+                            production_id=data.get("production_id", ""),
                         )
                     elif is_international:
                         captions, audio_length = create_tts_international(
@@ -1084,6 +1091,14 @@ def process_video_queue():
                     
                     video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
                     print("rendering video")
+                    _prod_id = data.get("production_id", "")
+                    _render_start = time.time()
+                    def _render_progress(pct):
+                        update_production_progress(_prod_id, {
+                            "stage": "render",
+                            "pct": pct,
+                            "elapsed_s": round(time.time() - _render_start, 1),
+                        })
                     render_video(
                         sound_path=sound_path, subtitle_path=subtitle_path,
                         overlay_path=overlay_path, audio_length=audio_length,
@@ -1091,6 +1106,7 @@ def process_video_queue():
                         subscribe_overlay_path=subscribe_overlay_local,
                         subscribe_first_at=data.get("subscribe_first_at", 30),
                         subscribe_interval=data.get("subscribe_interval", 180),
+                        progress_callback=_render_progress,
                     )
                     
                     try:
@@ -1180,6 +1196,7 @@ def create_video(video: dict):
         subscribe_overlay_filename=video.get("subscribe_overlay_filename", "overlay-subscribe-new.mp4"),
         subscribe_first_at=int(video.get("subscribe_first_at", 30)),
         subscribe_interval=int(video.get("subscribe_interval", 180)),
+        production_id=video.get("production_id", ""),
     )
     
     if error:
@@ -1528,6 +1545,29 @@ os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 IMAGEFX_BUCKET = "imagefx"
+
+def update_production_progress(production_id: str, progress: dict):
+    """Update processing_progress JSONB on the productions row in Supabase.
+
+    Called from TTS (after each chunk) and render (after each 1% milestone).
+    Silently ignores failures — progress display is best-effort.
+    """
+    if not production_id or not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    try:
+        requests.patch(
+            f"{SUPABASE_URL}/rest/v1/productions?id=eq.{production_id}",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json={"processing_progress": progress},
+            timeout=3,
+        )
+    except Exception:
+        pass
 
 def ensure_supabase_bucket():
     """Create imagefx bucket in Supabase Storage if it doesn't exist."""
@@ -1906,6 +1946,7 @@ def process_video_request(
     subscribe_overlay_url: str = "", subscribe_overlay_drive_folder: str = "",
     subscribe_overlay_filename: str = "overlay-subscribe-new.mp4",
     subscribe_first_at: int = 30, subscribe_interval: int = 180,
+    production_id: str = "",
 ) -> tuple[str, dict, str]:
     """Process video creation request."""
     if not text:
@@ -1969,6 +2010,7 @@ def process_video_request(
             "subscribe_overlay_filename": subscribe_overlay_filename,
             "subscribe_first_at": subscribe_first_at,
             "subscribe_interval": subscribe_interval,
+            "production_id": production_id,
         },
         "created_at": time.time()
     }
