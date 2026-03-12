@@ -810,7 +810,8 @@ def format_time(seconds):
     return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
 def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video_path, output_path,
-                 subscribe_overlay_path=None, subscribe_first_at=30, subscribe_interval=180):
+                 subscribe_overlay_path=None, subscribe_first_at=30, subscribe_interval=180,
+                 progress_callback=None):
     """
     Renders a video with the given sound, subtitle, overlay image, and a background video.
     Uses concat demuxer for seamless background looping (no stream_loop stutter).
@@ -959,6 +960,7 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
         )
         
         # Process the output line by line as it becomes available
+        last_reported_pct = -1
         for line in process.stderr:
             # Extract time information for progress tracking
             if "time=" in line and "speed=" in line:
@@ -968,10 +970,17 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
                     # Convert HH:MM:SS.MS format to seconds
                     h, m, s = time_str.split(":")
                     seconds = float(h) * 3600 + float(m) * 60 + float(s)
-                    
+
                     # Calculate progress percentage
                     progress = min(100, (seconds / audio_length) * 100)
                     print(f"Processing: {progress:.2f}% complete (Time: {time_str} / Total: {format_time(audio_length)})")
+                    pct_int = int(progress)
+                    if progress_callback and pct_int != last_reported_pct:
+                        last_reported_pct = pct_int
+                        try:
+                            progress_callback(pct_int)
+                        except Exception:
+                            pass
                 except (ValueError, IndexError) as e:
                     # If parsing fails, just print the line
                     print(f"ffmpeg: {line.strip()}")
