@@ -83,37 +83,40 @@ def log(msg):
 
 
 def get_credentials(channel_credential):
-    """Load OAuth2 credentials from Supabase youtube_credentials table."""
+    """Load OAuth2 credentials from Supabase youtube_credentials table.
+    Returns (credentials, expected_channel_id_or_None).
+    """
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
             "SUPABASE_URL and SUPABASE_ANON_KEY must be set. "
             "Add them to /root/.env or pass via environment."
         )
-    
+
     log(f"Fetching credentials for '{channel_credential}' from Supabase...")
-    
+
     resp = requests.get(
         f"{SUPABASE_URL}/rest/v1/youtube_credentials"
-        f"?credential_name=eq.{channel_credential}&select=client_id,client_secret,refresh_token",
+        f"?credential_name=eq.{channel_credential}&select=client_id,client_secret,refresh_token,channel_id",
         headers={
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
         },
         timeout=15,
     )
-    
+
     if resp.status_code != 200:
         raise RuntimeError(f"Supabase query failed: HTTP {resp.status_code} — {resp.text[:200]}")
-    
+
     rows = resp.json()
     if not rows:
         raise FileNotFoundError(
             f"Credential '{channel_credential}' not found in Supabase. "
             f"Add it via Pipeline Manager → Editar Canal → YouTube Credential → + Nova."
         )
-    
+
     cred_data = rows[0]
-    
+    expected_channel_id = cred_data.get("channel_id", "") or ""
+
     credentials = Credentials(
         token=None,
         refresh_token=cred_data["refresh_token"],
@@ -121,13 +124,27 @@ def get_credentials(channel_credential):
         client_secret=cred_data["client_secret"],
         token_uri="https://oauth2.googleapis.com/token"
     )
-    
+
     # Force refresh — uses whatever scopes the token was originally granted
     from google.auth.transport.requests import Request
     credentials.refresh(Request())
     log(f"Token refreshed, expires: {credentials.expiry}")
-    
-    return credentials
+
+    return credentials, expected_channel_id
+
+
+def list_accessible_channels(credentials):
+    """Return list of YouTube channels accessible with these credentials."""
+    youtube = build("youtube", "v3", credentials=credentials)
+    resp = youtube.channels().list(part="snippet", mine=True, maxResults=50).execute()
+    channels = []
+    for item in resp.get("items", []):
+        channels.append({
+            "id": item["id"],
+            "title": item["snippet"]["title"],
+            "custom_url": item["snippet"].get("customUrl", ""),
+        })
+    return channels
 
 
 def download_from_drive(drive_file_id, folder_id, credentials=None):
@@ -217,14 +234,42 @@ def find_local_video(drive_file_id):
     return None
 
 
-def upload_to_youtube(credentials, file_path, metadata):
-    """Upload video to YouTube using resumable upload"""
+def upload_to_youtube(credentials, file_path, metadata, expected_channel_id=""):
+    """Upload video to YouTube using resumable upload.
+
+    expected_channel_id: if set, verifies the upload landed on the correct channel
+    and raises an error if it didn't (prevents silent wrong-channel uploads).
+    """
     youtube = build("youtube", "v3", credentials=credentials)
-    
+
+    # ── Channel verification (before upload to fail fast) ──
+    if expected_channel_id:
+        channels = list_accessible_channels(credentials)
+        ids = [c["id"] for c in channels]
+        if expected_channel_id not in ids:
+            names = ", ".join(f"{c['title']} ({c['id']})" for c in channels)
+            raise RuntimeError(
+                f"Credential does not have access to channel '{expected_channel_id}'. "
+                f"Accessible channels: {names}. "
+                f"Generate a new refresh token while logged into the correct channel."
+            )
+        log(f"Channel verified: {expected_channel_id} ✓")
+    else:
+        # Log which channel will receive the upload so the user knows
+        channels = list_accessible_channels(credentials)
+        if channels:
+            default = channels[0]
+            log(f"Uploading to channel: {default['title']} ({default['id']})")
+            if len(channels) > 1:
+                others = ", ".join(f"{c['title']} ({c['id']})" for c in channels[1:])
+                log(f"WARNING: This credential has access to {len(channels)} channels. "
+                    f"Other channels: {others}. "
+                    f"Set channel_id in youtube_credentials to enforce the correct one.")
+
     tags = metadata.get("tags", "")
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(",") if t.strip()]
-    
+
     body = {
         "snippet": {
             "title": metadata["title"][:100].replace("{", "").replace("}", ""),
@@ -239,29 +284,28 @@ def upload_to_youtube(credentials, file_path, metadata):
             "selfDeclaredMadeForKids": False,
         }
     }
-    
+
     # Add publishAt for scheduling
     publish_at = metadata.get("publish_at", "")
     if publish_at and metadata.get("privacy_status") == "private":
         body["status"]["publishAt"] = publish_at
-    
+
     file_size = os.path.getsize(file_path)
     log(f"Uploading to YouTube: {metadata['title'][:50]}... ({file_size / 1024 / 1024:.0f} MB)")
-    
-    # Use resumable upload with 10MB chunks
+
     media = MediaFileUpload(
         file_path,
         mimetype="video/mp4",
         resumable=True,
-        chunksize=10 * 1024 * 1024  # 10MB chunks
+        chunksize=10 * 1024 * 1024
     )
-    
+
     request = youtube.videos().insert(
         part="snippet,status",
         body=body,
         media_body=media
     )
-    
+
     response = None
     retries = 0
     while response is None:
@@ -278,10 +322,10 @@ def upload_to_youtube(credentials, file_path, metadata):
                 time.sleep(wait)
             else:
                 raise
-    
+
     video_id = response["id"]
     log(f"Upload complete! Video ID: {video_id}")
-    
+
     return video_id
 
 
@@ -332,6 +376,7 @@ def main():
     parser.add_argument("--json", required=False, help="JSON input with video metadata")
     parser.add_argument("--update", action="store_true", help="Self-update from GitHub")
     parser.add_argument("--test", action="store_true", help="Test Supabase connection")
+    parser.add_argument("--list-channels", metavar="CREDENTIAL", help="List YouTube channels accessible with a credential")
     args = parser.parse_args()
     
     # ── Self-update mode ──
@@ -364,37 +409,57 @@ def main():
     if args.test:
         try:
             resp = requests.get(
-                f"{SUPABASE_URL}/rest/v1/youtube_credentials?select=credential_name,channel_name",
+                f"{SUPABASE_URL}/rest/v1/youtube_credentials?select=credential_name,channel_name,channel_id",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
                 timeout=10,
             )
             creds = resp.json()
             print(f"OK — {len(creds)} credencial(is):")
             for c in creds:
-                print(f"  {c['credential_name']} ({c['channel_name']})")
+                ch_id = c.get('channel_id') or '(channel_id not set)'
+                print(f"  {c['credential_name']} ({c['channel_name']}) → {ch_id}")
         except Exception as e:
             print(f"ERRO: {e}")
             sys.exit(1)
         sys.exit(0)
-    
+
+    # ── List channels mode ──
+    if args.list_channels:
+        try:
+            credentials, _ = get_credentials(args.list_channels)
+            channels = list_accessible_channels(credentials)
+            print(f"Channels accessible with '{args.list_channels}':")
+            for i, ch in enumerate(channels):
+                marker = " ← DEFAULT (upload goes here)" if i == 0 else ""
+                print(f"  [{ch['id']}] {ch['title']} {ch.get('custom_url', '')}{marker}")
+            if len(channels) > 1:
+                print()
+                print("To fix wrong-channel uploads:")
+                print("  1. In youtube_credentials table, set channel_id = the ID shown above for the correct channel")
+                print("  2. If the correct channel is NOT listed, generate a new refresh token while logged into that channel")
+        except Exception as e:
+            print(f"ERRO: {e}")
+            sys.exit(1)
+        sys.exit(0)
+
     # ── Upload mode ──
     if not args.json:
         parser.print_help()
         sys.exit(1)
-    
+
     try:
         params = json.loads(args.json)
     except json.JSONDecodeError as e:
         print(json.dumps({"success": False, "error": f"Invalid JSON: {e}"}))
         sys.exit(1)
-    
+
     local_path = None
-    
+
     try:
         # 1. Get credentials
         channel_cred = params.get("channel_credential", "default")
         log(f"Channel credential: {channel_cred}")
-        credentials = get_credentials(channel_cred)
+        credentials, expected_channel_id = get_credentials(channel_cred)
         
         # 2. Get video file
         drive_file_id = params.get("drive_file_id", "")
@@ -410,7 +475,7 @@ def main():
             raise ValueError("drive_file_id is required")
         
         # 3. Upload to YouTube
-        video_id = upload_to_youtube(credentials, local_path, params)
+        video_id = upload_to_youtube(credentials, local_path, params, expected_channel_id)
         
         # 4. Set thumbnail
         set_thumbnail(credentials, video_id, params.get("thumb_url", ""))
