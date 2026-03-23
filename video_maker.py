@@ -10,6 +10,20 @@ import re
 
 CUDA = os.environ.get('CUDA', '0') == '1'
 
+# ── V4 Subtitle Color Presets ──
+# ASS color format: &HAABBGGRR (alpha, blue, green, red — hex)
+# &H00 prefix = fully opaque
+COLOR_PRESETS = [
+    {"name": "yellow",  "current": "&H0000FFFF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "cyan",    "current": "&H00FFFF00", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "orange",  "current": "&H000080FF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "magenta", "current": "&H00FF00FF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "red",     "current": "&H000000FF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "lime",    "current": "&H0000FF00", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "pink",    "current": "&H00FF69B4", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+    {"name": "gold",    "current": "&H0000D7FF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"},
+]
+
 def _render_dynamic_red_box(
     overlay,  # The main Image object to paste onto
     draw,  # The ImageDraw object for the overlay
@@ -216,6 +230,64 @@ def create_overlay_v3(
 
     overlay.save(output_path)
     print(f"V3 overlay saved to {output_path}")
+
+def create_overlay_v4(
+    person_image_path,
+    position,
+    output_path,
+    overlay_size=(1920, 1080),
+    subtitle_background_color=(0, 0, 0, 180),
+):
+    """V4 overlay: background-removed character + subtitle strip (bottom 25%).
+
+    position: 'left' | 'center' | 'right'
+      - left:   character's leftmost pixel at canvas x=0
+      - center: character horizontally centered
+      - right:  character's rightmost pixel at canvas right edge
+
+    Vertical: character base anchored at y=strip_y (top of subtitle strip).
+    Subtitle strip occupies bottom 25% of canvas (y=810 to 1080 for 1080p).
+    """
+    width, height = overlay_size
+    overlay = Image.new("RGBA", overlay_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Subtitle strip: bottom 25%
+    strip_y = int(height * 0.75)  # 810px for 1080p
+
+    draw.rectangle([(0, strip_y), (width, height)], fill=subtitle_background_color)
+
+    try:
+        person_img = Image.open(person_image_path).convert("RGBA")
+    except FileNotFoundError as e:
+        raise Exception(f"Cannot open person image: {e}")
+    except Exception as e:
+        raise Exception(f"Cannot open person image resource: {e}")
+
+    orig_w, orig_h = person_img.size
+
+    # Scale character to fill available height above strip
+    max_char_height = strip_y
+    char_height = min(orig_h, max_char_height)
+    char_width = int(char_height * orig_w / orig_h)
+
+    person_img_resized = person_img.resize((char_width, char_height), Image.LANCZOS)
+
+    # Horizontal position
+    if position == "left":
+        char_x = 0
+    elif position == "right":
+        char_x = width - char_width
+    else:  # center
+        char_x = (width - char_width) // 2
+
+    # Vertical: base of character touches top of subtitle strip
+    char_y = strip_y - char_height
+
+    overlay.paste(person_img_resized, (char_x, char_y), person_img_resized)
+    overlay.save(output_path)
+    print(f"V4 overlay saved | position={position} | char={char_width}×{char_height} | x={char_x}")
+
 
 def create_tts_english(text, output_path, lang_code, voice):
     pipeline = KPipeline(
@@ -798,6 +870,176 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"V2 Karaoke subtitle file created: {output_path}")
     return output_path
 
+
+def create_subtitle_v4_karaoke(word_captions, output_path, color_preset, font_size=80,
+                                max_chars_per_line=40, max_lines=2):
+    """V4 karaoke subtitle: colored word-by-word highlight over the bottom-25% subtitle strip.
+
+    color_preset: dict from COLOR_PRESETS, e.g.:
+        {"name": "yellow", "current": "&H0000FFFF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"}
+
+    Subtitle strip occupies y=810..1080 on a 1080p canvas.
+    Text is positioned at the vertical center of the strip (y=945) with Alignment=5.
+    No outline — the semi-transparent strip provides the background.
+    """
+    COLOR_UNSPOKEN = color_preset["unspoken"]
+    COLOR_CURRENT  = color_preset["current"]
+    COLOR_SPOKEN   = color_preset["spoken"]
+
+    # Center of the subtitle strip: 810 + (1080-810)/2 = 945
+    pos_y = 945
+
+    ass_content = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,{font_size},{COLOR_UNSPOKEN},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,5,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    # ── Normalize caption keys ──
+    normalized_captions = []
+    for cap in word_captions:
+        if isinstance(cap, dict):
+            s = cap.get("start_ts", cap.get("start", cap.get("s", 0)))
+            e = cap.get("end_ts",   cap.get("end",   cap.get("e", 0)))
+            t = cap.get("text",     cap.get("word",  cap.get("w", "")))
+            normalized_captions.append({"start_ts": float(s), "end_ts": float(e), "text": str(t)})
+        elif hasattr(cap, "start_ts"):
+            normalized_captions.append({"start_ts": float(cap.start_ts), "end_ts": float(cap.end_ts),
+                                         "text": str(getattr(cap, "text", getattr(cap, "word", "")))})
+        elif hasattr(cap, "start"):
+            normalized_captions.append({"start_ts": float(cap.start), "end_ts": float(cap.end),
+                                         "text": str(getattr(cap, "text", getattr(cap, "word", "")))})
+    word_captions = normalized_captions
+
+    # ── Merge punctuation ──
+    merged = []
+    for cap in word_captions:
+        if cap["text"] in string.punctuation and merged:
+            merged[-1]["text"] += cap["text"]
+            merged[-1]["end_ts"] = cap["end_ts"]
+        else:
+            merged.append(cap.copy())
+
+    # ── Group into segments (2 lines, max chars/line) ──
+    segments = []
+    current_seg = []
+    current_line_words = []
+    current_line_len = 0
+    current_line_num = 0
+
+    for cap in merged:
+        word = cap["text"]
+        potential = current_line_len + (1 if current_line_words else 0) + len(word)
+        if potential > max_chars_per_line and current_line_words:
+            current_seg.extend(current_line_words)
+            current_line_words = []
+            current_line_len = 0
+            current_line_num += 1
+            if current_line_num >= max_lines:
+                segments.append(current_seg)
+                current_seg = []
+                current_line_num = 0
+        current_line_words.append(cap)
+        current_line_len += (1 if current_line_len > 0 else 0) + len(word)
+
+    if current_line_words:
+        current_seg.extend(current_line_words)
+    if current_seg:
+        segments.append(current_seg)
+
+    # ── Extend word end times to eliminate gaps ──
+    for seg_idx, seg_words in enumerate(segments):
+        for w_idx in range(len(seg_words) - 1):
+            nxt = seg_words[w_idx + 1]["start_ts"]
+            if nxt > seg_words[w_idx]["end_ts"]:
+                seg_words[w_idx]["end_ts"] = nxt
+        if seg_idx < len(segments) - 1:
+            nxt_seg = segments[seg_idx + 1]
+            if nxt_seg:
+                nxt_start = nxt_seg[0]["start_ts"]
+                last = seg_words[-1]
+                if nxt_start > last["end_ts"]:
+                    last["end_ts"] = nxt_start
+
+    segment_end_times = []
+
+    for seg_idx, seg_words in enumerate(segments):
+        if not seg_words:
+            continue
+
+        seg_start = seg_words[0]["start_ts"]
+        seg_end   = seg_words[-1]["end_ts"]
+
+        if seg_idx > 0 and segment_end_times:
+            prev_end = segment_end_times[-1]
+            if seg_start < prev_end:
+                shift = prev_end - seg_words[0]["start_ts"]
+                for wd in seg_words:
+                    wd["start_ts"] += shift
+                    wd["end_ts"]   += shift
+                seg_start = seg_words[0]["start_ts"]
+                seg_end   = seg_words[-1]["end_ts"]
+
+        # Break into display lines
+        lines = []
+        cur_line = []
+        cur_len  = 0
+        for wd in seg_words:
+            pot = cur_len + (1 if cur_line else 0) + len(wd["text"])
+            if pot > max_chars_per_line and cur_line:
+                lines.append(cur_line)
+                cur_line = []
+                cur_len  = 0
+            cur_line.append(wd)
+            cur_len += (1 if cur_len > 0 else 0) + len(wd["text"])
+        if cur_line:
+            lines.append(cur_line)
+        lines = lines[:max_lines]
+
+        # ── Transition-based events ──
+        for word_idx, cur_word in enumerate(seg_words):
+            ev_start = cur_word["start_ts"]
+            ev_end   = seg_words[word_idx + 1]["start_ts"] if word_idx < len(seg_words) - 1 else seg_end
+            if ev_end <= ev_start:
+                ev_end = ev_start + 0.05
+
+            colored_lines = []
+            for line_words in lines:
+                colored_line = ""
+                for wd in line_words:
+                    idx_in_seg = seg_words.index(wd)
+                    if idx_in_seg < word_idx:
+                        colored_line += f"{{\\c{COLOR_SPOKEN}}}{wd['text']}{{\\c}}"
+                    elif idx_in_seg == word_idx:
+                        colored_line += f"{{\\c{COLOR_CURRENT}}}{wd['text']}{{\\c}}"
+                    else:
+                        colored_line += f"{{\\c{COLOR_UNSPOKEN}}}{wd['text']}{{\\c}}"
+                    if wd != line_words[-1]:
+                        colored_line += " "
+                colored_lines.append(colored_line)
+
+            formatted = "\\N".join(colored_lines)
+            formatted  = f"{{\\pos(960,{pos_y})}}" + formatted
+
+            ass_content += (f"Dialogue: 0,{format_time(ev_start)},{format_time(ev_end)},"
+                            f"Default,,0,0,0,,{formatted}\n")
+
+        segment_end_times.append(seg_end)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    print(f"V4 karaoke subtitle created: {output_path} | preset={color_preset['name']}")
+    return output_path
+
+
 def format_time(seconds):
     """
     Convert seconds to ASS time format (H:MM:SS.cc)
@@ -1043,3 +1285,177 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
         except:
             pass
         return False
+
+
+def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_path,
+                    audio_length, effect_paths=None, progress_callback=None):
+    """V4 video render: multiple background clips + optional screen-blend particle effects.
+
+    bg_paths:     List of local .mp4 paths used as background (concatenated and cycled).
+    effect_paths: Optional list of local .mp4 paths for particle overlays (screen blend).
+                  Screen blend: black → transparent, white/color → visible over video.
+    """
+    effect_paths = effect_paths or []
+    concat_list_path = None
+    effect_concat_paths = []
+
+    try:
+        # ── 1. Build background concat list (all clips, cycled to cover audio_length) ──
+        total_bg_dur = 0.0
+        for p in bg_paths:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", p],
+                    capture_output=True, text=True, timeout=10,
+                )
+                dur = float(probe.stdout.strip()) if probe.returncode == 0 else 30.0
+            except Exception:
+                dur = 30.0
+            total_bg_dur += max(dur, 1.0)
+
+        if total_bg_dur <= 0:
+            total_bg_dur = 30.0
+
+        cycles_needed = int(audio_length / total_bg_dur) + 2
+        concat_list_path = os.path.join(os.path.dirname(output_path), "bg_v4_concat.txt")
+
+        with open(concat_list_path, "w") as f:
+            for _ in range(cycles_needed):
+                for p in bg_paths:
+                    safe = os.path.abspath(p).replace("'", "'\\''")
+                    f.write(f"file '{safe}'\n")
+
+        print(f"[BG-V4] {len(bg_paths)} clip(s) × {cycles_needed} cycles = "
+              f"{total_bg_dur * cycles_needed:.0f}s (need {audio_length:.0f}s)")
+
+        # ── 2. Build FFmpeg inputs ──
+        cmd = ["ffmpeg", "-y"]
+        if CUDA:
+            cmd.extend(["-hwaccel", "cuda"])
+
+        # Input 0: background (looped concat)
+        cmd.extend(["-f", "concat", "-safe", "0",
+                    "-t", str(audio_length), "-i", concat_list_path])
+
+        # Input 1: overlay PNG
+        cmd.extend(["-i", overlay_path])
+
+        # Input 2: audio
+        cmd.extend(["-i", sound_path])
+
+        # Inputs 3..N: particle effect videos (each individually looped)
+        for i, ep in enumerate(effect_paths):
+            try:
+                probe_e = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", ep],
+                    capture_output=True, text=True, timeout=10,
+                )
+                e_dur = float(probe_e.stdout.strip()) if probe_e.returncode == 0 else 10.0
+            except Exception:
+                e_dur = 10.0
+            e_dur = max(e_dur, 1.0)
+            e_loops = int(audio_length / e_dur) + 2
+
+            e_concat = os.path.join(os.path.dirname(output_path), f"effect_{i}_concat.txt")
+            effect_concat_paths.append(e_concat)
+
+            with open(e_concat, "w") as f:
+                for _ in range(e_loops):
+                    safe_ep = os.path.abspath(ep).replace("'", "'\\''")
+                    f.write(f"file '{safe_ep}'\n")
+
+            cmd.extend(["-f", "concat", "-safe", "0",
+                        "-t", str(audio_length), "-i", e_concat])
+            print(f"[EFFECT-V4] effect {i}: {e_dur:.1f}s × {e_loops} loops")
+
+        # ── 3. Build filter_complex ──
+        filter_parts = []
+        filter_parts.append("[0:v]scale=1920:1080,gblur=sigma=2[scaled]")
+        filter_parts.append("[scaled][1:v]overlay=format=auto[with_person]")
+
+        current_label = "with_person"
+        for i in range(len(effect_paths)):
+            next_label = f"fx{i}"
+            filter_parts.append(
+                f"[{current_label}][{3 + i}:v]blend=all_mode=screen[{next_label}]"
+            )
+            current_label = next_label
+
+        # Escape subtitle path for FFmpeg (colons must be escaped on Linux)
+        safe_sub = subtitle_path.replace("\\", "/").replace(":", "\\:")
+        filter_parts.append(f"[{current_label}]subtitles={safe_sub}[v]")
+
+        filter_complex = ";".join(filter_parts)
+
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "2:a",
+            "-c:v", "h264_nvenc" if CUDA else "libx264",
+            "-preset", "fast" if CUDA else "ultrafast",
+            "-crf", "25",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-t", str(audio_length),
+            output_path,
+        ])
+
+        print(f"[RENDER-V4] Starting FFmpeg...")
+
+        # ── 4. Execute with progress tracking ──
+        process = subprocess.Popen(
+            cmd, stderr=subprocess.PIPE, universal_newlines=True, text=True
+        )
+
+        last_pct = -1
+        for line in process.stderr:
+            if "time=" in line and "speed=" in line:
+                try:
+                    time_str = line.split("time=")[1].split(" ")[0]
+                    h, m, s = time_str.split(":")
+                    seconds = float(h) * 3600 + float(m) * 60 + float(s)
+                    pct = min(100, int((seconds / audio_length) * 100))
+                    print(f"[RENDER-V4] {pct}% ({time_str})")
+                    if progress_callback and pct != last_pct:
+                        last_pct = pct
+                        try:
+                            progress_callback(pct)
+                        except Exception:
+                            pass
+                except (ValueError, IndexError):
+                    pass
+            elif any(kw in line for kw in [
+                "ffmpeg version", "built with", "configuration:", "libav",
+                "Input #", "Metadata:", "Duration:", "Stream #",
+                "Press [q]", "Output #", "Stream mapping:",
+                "frame=", "fps=", "[libx264", "kb/s:",
+            ]):
+                pass
+            else:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("["):
+                    print(f"ffmpeg: {stripped}")
+
+        return_code = process.wait()
+
+        if return_code != 0:
+            print(f"[RENDER-V4] ffmpeg exited with code {return_code}")
+            return False
+
+        return True
+
+    except Exception as e:
+        print(f"[RENDER-V4] Error: {e}")
+        return False
+
+    finally:
+        for cp in ([concat_list_path] + effect_concat_paths):
+            if cp:
+                try:
+                    if os.path.exists(cp):
+                        os.remove(cp)
+                except Exception:
+                    pass
