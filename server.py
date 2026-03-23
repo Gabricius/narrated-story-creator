@@ -569,9 +569,7 @@ else:
     # Use fewer threads to reduce memory overhead on low-RAM containers
     num_threads = os.environ.get("NUM_THREADS", max(1, num_cores))
     torch.set_num_threads(int(num_threads))
-    # Reduce interop threads too
-    torch.set_num_interop_threads(1)
-    print(f"[MEM] Torch threads: {num_threads}, interop: 1")
+    print(f"[MEM] Torch threads: {num_threads}, interop: 1 (set at import)")
 
 # Memory optimization for low-RAM environments
 os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
