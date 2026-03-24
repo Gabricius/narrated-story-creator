@@ -1556,7 +1556,13 @@ def create_test_video(params: dict = {}):
     voice = params.get("voice", "af_heart")
     num_chunks = int(params.get("chunks", 2))
     version = params.get("version", "v2")
-    
+    character_position = params.get("character_position", "random")
+    subtitle_color_preset = params.get("subtitle_color_preset", "random")
+    poof_remove_bg = bool(params.get("poof_remove_bg", False))
+    bg_video_folder_ids = params.get("bg_video_folder_ids", [])
+    effect_overlay_ids = params.get("effect_overlay_ids", [])
+    max_bg_clips = int(params.get("max_bg_clips", 10))
+
     if not bg_video_url:
         return JSONResponse(content={"error": "bg_video_url is required"}, status_code=400)
     
@@ -1600,11 +1606,17 @@ def create_test_video(params: dict = {}):
         subscribe_overlay_filename=params.get("subscribe_overlay_filename", "overlay-subscribe-new.mp4"),
         subscribe_first_at=int(params.get("subscribe_first_at", 30)),
         subscribe_interval=int(params.get("subscribe_interval", 180)),
+        character_position=character_position,
+        subtitle_color_preset=subtitle_color_preset,
+        poof_remove_bg=poof_remove_bg,
+        bg_video_folder_ids=bg_video_folder_ids,
+        effect_overlay_ids=effect_overlay_ids,
+        max_bg_clips=max_bg_clips,
     )
-    
+
     if error:
         return JSONResponse(content={"error": error}, status_code=400)
-    
+
     videos[video_id] = video_data
     save_videos()
     video_queue.put(video_id)
