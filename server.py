@@ -1427,6 +1427,46 @@ def upload_local_to_drive(video_id: str = None):
     
     return {"uploaded": len([r for r in results if r["status"] == "uploaded"]), "results": results}
 
+@app.post("/tts")
+async def tts_preview(request: Request):
+    """Generate a short TTS audio preview for a given voice.
+    Body: { "text": "...", "voice": "af_heart", "speed": 1.0 }
+    Returns: WAV audio blob (audio/wav).
+    """
+    body = await request.json()
+    text  = str(body.get("text", "Hello, this is a voice preview sample.")).strip()
+    voice = str(body.get("voice", "af_heart")).strip()
+
+    if voice not in LANGUAGE_VOICE_MAP:
+        return JSONResponse({"error": f"Unknown voice: {voice}"}, status_code=400)
+
+    cfg = LANGUAGE_VOICE_MAP[voice]
+    lang_code      = cfg["lang_code"]
+    is_international = cfg["international"]
+
+    text = normalize_text_for_tts(text)
+
+    tmp_path = f"/tmp/tts_preview_{uuid.uuid4().hex}.wav"
+    try:
+        if is_international:
+            create_tts_international(text, tmp_path, lang_code, voice)
+        else:
+            create_tts_english(text, tmp_path, lang_code, voice)
+
+        return FileResponse(tmp_path, media_type="audio/wav", background=None)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        # Schedule cleanup after response is sent
+        async def _cleanup():
+            await asyncio.sleep(10)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        asyncio.create_task(_cleanup())
+
+
 @app.get("/api/queue")
 def get_queue_status():
     return {
