@@ -1777,9 +1777,10 @@ def remove_background_poof(image_path: str, poof_api_key: str) -> str:
     print(f"[V4] POOF: removing background from {image_path}")
     with open(image_path, "rb") as f:
         resp = requests.post(
-            "https://api.poof.bg/v1/remove-background",
-            headers={"Authorization": f"Bearer {poof_api_key}"},
-            files={"image": f},
+            "https://api.poof.bg/v1/remove",
+            headers={"x-api-key": poof_api_key},
+            files={"image_file": f},
+            data={"format": "png", "size": "full"},
             timeout=60,
         )
     resp.raise_for_status()
