@@ -1,5 +1,6 @@
 from PIL import Image, ImageDraw, ImageFont
 import os
+import random
 import string
 from kokoro import KPipeline
 import soundfile as sf
@@ -1338,8 +1339,8 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         cmd.extend(["-f", "concat", "-safe", "0",
                     "-t", str(audio_length), "-i", concat_list_path])
 
-        # Input 1: overlay PNG
-        cmd.extend(["-i", overlay_path])
+        # Input 1: overlay PNG — loop para manter visivel durante todo o video
+        cmd.extend(["-loop", "1", "-i", overlay_path])
 
         # Input 2: audio
         cmd.extend(["-i", sound_path])
@@ -1378,8 +1379,11 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         current_label = "with_person"
         for i in range(len(effect_paths)):
             next_label = f"fx{i}"
+            fx_opacity = round(random.uniform(0.40, 0.70), 2)
+            boosted = f"fx_boosted_{i}"
+            filter_parts.append(f"[{3 + i}:v]eq=contrast=8.1[{boosted}]")
             filter_parts.append(
-                f"[{current_label}][{3 + i}:v]blend=all_mode=screen[{next_label}]"
+                f"[{current_label}][{boosted}]blend=all_mode=screen:c0_opacity={fx_opacity}:c1_opacity=0:c2_opacity=0[{next_label}]"
             )
             current_label = next_label
 
