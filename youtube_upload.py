@@ -47,6 +47,12 @@ import tempfile
 import time
 import requests
 
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 # Google API imports
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -341,15 +347,38 @@ def set_thumbnail(credentials, video_id, thumb_url):
         resp = requests.get(thumb_url, timeout=30)
         resp.raise_for_status()
         
-        thumb_path = os.path.join(TEMP_DIR, f"thumb_{video_id}.jpg")
+        # Detect actual image type from Content-Type header (HCTI serves PNG, RenderForm serves JPEG)
+        content_type = resp.headers.get('Content-Type', 'image/jpeg').split(';')[0].strip()
+        ext_map = {'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif', 'image/webp': '.webp'}
+        ext  = ext_map.get(content_type, '.jpg')
+        mime = content_type if content_type in ext_map else 'image/jpeg'
+
+        thumb_path = os.path.join(TEMP_DIR, f"thumb_{video_id}{ext}")
         with open(thumb_path, 'wb') as f:
             f.write(resp.content)
-        
+
+        MAX_THUMB_BYTES = 2 * 1024 * 1024  # 2MB YouTube limit
+
+        # Compress if over limit
+        if os.path.getsize(thumb_path) >= MAX_THUMB_BYTES and _PIL_AVAILABLE:
+            log(f"Thumbnail too large ({os.path.getsize(thumb_path)} bytes), compressing...")
+            img = PILImage.open(thumb_path).convert("RGB")
+            img.thumbnail((1280, 720), PILImage.LANCZOS)
+            compressed_path = os.path.join(TEMP_DIR, f"thumb_{video_id}_compressed.jpg")
+            for quality in (85, 70, 55):
+                img.save(compressed_path, "JPEG", quality=quality, optimize=True)
+                if os.path.getsize(compressed_path) < MAX_THUMB_BYTES:
+                    break
+            os.remove(thumb_path)
+            thumb_path = compressed_path
+            mime = "image/jpeg"
+            log(f"Compressed to {os.path.getsize(thumb_path)} bytes (quality={quality})")
+
         # Upload to YouTube
         youtube = build("youtube", "v3", credentials=credentials)
-        media = MediaFileUpload(thumb_path, mimetype="image/jpeg")
+        media = MediaFileUpload(thumb_path, mimetype=mime)
         youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
-        
+
         os.remove(thumb_path)
         log("Thumbnail set successfully")
         
