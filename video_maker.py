@@ -1289,14 +1289,23 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
 
 
 def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_path,
-                    audio_length, effect_paths=None, progress_callback=None):
-    """V4 video render: multiple background clips + optional screen-blend particle effects.
+                    audio_length, effect_paths=None, effect_layers_resolved=None,
+                    progress_callback=None):
+    """V4 video render: multiple background clips + optional particle effect layers.
 
-    bg_paths:     List of local .mp4 paths used as background (concatenated and cycled).
-    effect_paths: Optional list of local .mp4 paths for particle overlays (screen blend).
-                  Screen blend: black → transparent, white/color → visible over video.
+    bg_paths:              List of local .mp4 paths used as background (concatenated and cycled).
+    effect_layers_resolved: List of dicts: {local_path, opacity, blend_mode, label}.
+                           Supported blend_mode values: colorkey_black, screen, chromakey_green, add.
+    effect_paths:          Legacy fallback — list of local .mp4 paths (applied as screen blend).
     """
-    effect_paths = effect_paths or []
+    # Normalise to effect_layers_resolved (prefer new, fall back to legacy)
+    if effect_layers_resolved is None and effect_paths:
+        effect_layers_resolved = [
+            {'local_path': p, 'opacity': round(random.uniform(0.40, 0.70), 2),
+             'blend_mode': 'screen', 'label': f'legacy-{i}'}
+            for i, p in enumerate(effect_paths)
+        ]
+    effect_layers_resolved = effect_layers_resolved or []
     concat_list_path = None
     effect_concat_paths = []
 
@@ -1345,8 +1354,9 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         # Input 2: audio
         cmd.extend(["-i", sound_path])
 
-        # Inputs 3..N: particle effect videos (each individually looped)
-        for i, ep in enumerate(effect_paths):
+        # Inputs 3..N: effect layer videos (each individually looped)
+        for i, layer in enumerate(effect_layers_resolved):
+            ep = layer['local_path']
             try:
                 probe_e = subprocess.run(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -1369,7 +1379,7 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
 
             cmd.extend(["-f", "concat", "-safe", "0",
                         "-t", str(audio_length), "-i", e_concat])
-            print(f"[EFFECT-V4] effect {i}: {e_dur:.1f}s × {e_loops} loops")
+            print(f"[EFFECT-V4] layer {i} '{layer.get('label', '')}': {e_dur:.1f}s × {e_loops} loops | blend={layer['blend_mode']} opacity={layer['opacity']}")
 
         # ── 3. Build filter_complex ──
         filter_parts = []
@@ -1377,15 +1387,45 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         filter_parts.append("[scaled][1:v]overlay=format=auto[with_person]")
 
         current_label = "with_person"
-        for i in range(len(effect_paths)):
-            next_label = f"fx{i}"
-            fx_opacity = round(random.uniform(0.40, 0.70), 2)
-            boosted = f"fx_boosted_{i}"
-            filter_parts.append(f"[{3 + i}:v]eq=contrast=8.1[{boosted}]")
-            filter_parts.append(
-                f"[{current_label}][{boosted}]blend=all_mode=screen:c0_opacity={fx_opacity}:c1_opacity=0:c2_opacity=0[{next_label}]"
-            )
-            current_label = next_label
+        for i, layer in enumerate(effect_layers_resolved):
+            input_idx = 3 + i
+            blend = layer['blend_mode']
+            opacity = layer['opacity']
+            out_label = f"fx{i}"
+
+            if blend == 'colorkey_black':
+                filter_parts.append(
+                    f"[{input_idx}:v]colorkey=0x000000:0.35:0.10,format=yuva420p[fxck{i}];"
+                    f"[{current_label}][fxck{i}]overlay=0:0:shortest=1[{out_label}]"
+                )
+            elif blend == 'screen':
+                boosted = f"fx_boosted_{i}"
+                filter_parts.append(f"[{input_idx}:v]eq=contrast=8.1[{boosted}]")
+                filter_parts.append(
+                    f"[{current_label}][{boosted}]blend=all_mode=screen:"
+                    f"c0_opacity={opacity}:c1_opacity=0:c2_opacity=0[{out_label}]"
+                )
+            elif blend == 'chromakey_green':
+                filter_parts.append(
+                    f"[{input_idx}:v]chromakey=green:0.3:0.0,format=yuva420p[fxcg{i}];"
+                    f"[{current_label}][fxcg{i}]overlay=0:0:shortest=1[{out_label}]"
+                )
+            elif blend == 'add':
+                filter_parts.append(
+                    f"[{input_idx}:v]format=yuv420p[fxadd{i}];"
+                    f"[{current_label}][fxadd{i}]blend=all_mode=addition:"
+                    f"c0_opacity={opacity}:c1_opacity=0:c2_opacity=0[{out_label}]"
+                )
+            else:
+                # Unknown blend — pass through as screen
+                boosted = f"fx_boosted_{i}"
+                filter_parts.append(f"[{input_idx}:v]eq=contrast=8.1[{boosted}]")
+                filter_parts.append(
+                    f"[{current_label}][{boosted}]blend=all_mode=screen:"
+                    f"c0_opacity={opacity}:c1_opacity=0:c2_opacity=0[{out_label}]"
+                )
+
+            current_label = out_label
 
         # Escape subtitle path for FFmpeg (colons must be escaped on Linux)
         safe_sub = subtitle_path.replace("\\", "/").replace(":", "\\:")
