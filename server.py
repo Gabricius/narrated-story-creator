@@ -1134,19 +1134,17 @@ def process_video_queue():
                             bg_paths = [bg_video_path]
 
                         # --- Effect overlays ---
-                        effect_ids = data.get("effect_overlay_ids", [])
-                        effect_paths = []
-                        for eid in effect_ids:
-                            epath = os.path.join(video_dir, f"effect_{eid}.mp4")
-                            try:
-                                download_drive_file(
-                                    f"https://drive.google.com/uc?id={eid}&export=download",
-                                    epath, timeout=120,
-                                )
-                                effect_paths.append(epath)
-                                print(f"[V4] Downloaded effect: {eid}")
-                            except Exception as eff_err:
-                                print(f"[V4] Warning: effect {eid} download failed: {eff_err}")
+                        effect_layers_config = get_effect_layers(data)
+                        effect_layers_resolved = []
+                        for layer in effect_layers_config:
+                            resolved = resolve_effect_layer(layer, video_dir)
+                            if resolved:
+                                effect_layers_resolved.append(resolved)
+                                print(f"[V4] Effect layer '{resolved['label']}' ready: "
+                                      f"{resolved['blend_mode']} opacity={resolved['opacity']}")
+                            else:
+                                print(f"[V4] Warning: effect layer "
+                                      f"'{layer.get('label', layer.get('id', '?'))}' could not be resolved")
 
                         render_video_v4(
                             bg_paths=bg_paths,
@@ -1155,9 +1153,17 @@ def process_video_queue():
                             subtitle_path=subtitle_path,
                             output_path=video_path,
                             audio_length=audio_length,
-                            effect_paths=effect_paths if effect_paths else None,
+                            effect_layers_resolved=effect_layers_resolved if effect_layers_resolved else None,
                             progress_callback=_render_progress,
                         )
+
+                        # Clean up resolved effect temp files
+                        for resolved in effect_layers_resolved:
+                            try:
+                                if os.path.exists(resolved["local_path"]):
+                                    os.remove(resolved["local_path"])
+                            except Exception:
+                                pass
                     else:
                         # Background video loop is handled by concat demuxer in render_video
                         # Download subscribe overlay if provided (green-screen video)
@@ -1278,11 +1284,12 @@ def create_video(video: dict):
         character_position=video.get("character_position", "random"),
         subtitle_color_preset=video.get("subtitle_color_preset", "random"),
         effect_overlay_ids=video.get("effect_overlay_ids", []),
+        effect_layers=video.get("effect_layers", []),
         bg_video_folder_ids=bg_video_folder_ids,
         max_bg_clips=int(video.get("max_bg_clips", 10)),
         poof_remove_bg=bool(video.get("poof_remove_bg", False)),
     )
-    
+
     if error:
         return {"error": error}
     
@@ -1651,6 +1658,7 @@ def create_test_video(params: dict = {}):
         poof_remove_bg=poof_remove_bg,
         bg_video_folder_ids=bg_video_folder_ids,
         effect_overlay_ids=effect_overlay_ids,
+        effect_layers=params.get("effect_layers", []),
         max_bg_clips=max_bg_clips,
     )
 
@@ -1831,6 +1839,114 @@ def select_bg_videos(folder_ids: list, max_clips: int, video_dir: str) -> list:
         print(f"[V4] Downloaded bg clip: {f.get('Name', f['ID'])}")
 
     return local_paths
+
+
+def get_effect_layers(data: dict) -> list:
+    """Return effect layers from request data, with backward compat for effect_overlay_ids.
+
+    New channels store effect_layers (list of EffectLayer dicts) in the request data.
+    Old channels only have effect_overlay_ids (list of Drive file IDs).
+    """
+    layers = data.get("effect_layers")
+    if layers:
+        return [l for l in layers if l.get("enabled", True)]
+    # Legacy fallback: synthesise a single colorkey_black layer from effect_overlay_ids
+    old_ids = data.get("effect_overlay_ids", [])
+    if old_ids:
+        return [{
+            "id": "legacy-effect",
+            "label": "Efeito (legado)",
+            "mode": "random_from_ids",
+            "drive_file_ids": old_ids,
+            "blend_mode": "colorkey_black",
+            "opacity_min": 1.0,
+            "opacity_max": 1.0,
+            "enabled": True,
+        }]
+    return []
+
+
+def resolve_effect_layer(layer: dict, video_dir: str) -> dict | None:
+    """Download the effect file for a layer. Returns resolved dict or None on failure."""
+    import json as _json
+    if not layer.get("enabled", True):
+        return None
+    mode = layer.get("mode", "random_from_ids")
+    layer_id = layer.get("id", "unknown")
+    tmp_path = os.path.join(video_dir, f"effect_{layer_id}.mp4")
+
+    if mode == "fixed":
+        file_id = layer.get("drive_file_id")
+        if not file_id:
+            return None
+        result = subprocess.run(
+            ["rclone", "backend", "copyid", f"{RCLONE_REMOTE}:", file_id, tmp_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"[EFFECT LAYER] rclone copyid failed for {file_id}: {result.stderr[:200]}")
+            return None
+
+    elif mode == "random_from_folder":
+        folder_id = layer.get("drive_folder_id")
+        if not folder_id:
+            return None
+        result = subprocess.run(
+            ["rclone", "lsjson", f"{RCLONE_REMOTE}:",
+             "--drive-root-folder-id", folder_id,
+             "--no-modtime", "--include", "*.mp4"],
+            capture_output=True, text=True, timeout=30,
+        )
+        try:
+            files = _json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else []
+        except Exception:
+            files = []
+        if not files:
+            print(f"[EFFECT LAYER] No mp4 files in folder {folder_id}")
+            return None
+        chosen = random.choice(files)
+        chosen_id = chosen.get("ID") or chosen.get("id")
+        if not chosen_id:
+            return None
+        res2 = subprocess.run(
+            ["rclone", "backend", "copyid", f"{RCLONE_REMOTE}:", chosen_id, tmp_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if res2.returncode != 0:
+            print(f"[EFFECT LAYER] rclone copyid failed for folder file {chosen_id}: {res2.stderr[:200]}")
+            return None
+
+    elif mode == "random_from_ids":
+        file_ids = layer.get("drive_file_ids", [])
+        if not file_ids:
+            return None
+        file_id = random.choice(file_ids)
+        result = subprocess.run(
+            ["rclone", "backend", "copyid", f"{RCLONE_REMOTE}:", file_id, tmp_path],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            print(f"[EFFECT LAYER] rclone copyid failed for {file_id}: {result.stderr[:200]}")
+            return None
+
+    else:
+        print(f"[EFFECT LAYER] Unknown mode: {mode}")
+        return None
+
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1000:
+        print(f"[EFFECT LAYER] File too small or missing: {tmp_path}")
+        return None
+
+    opacity_min = float(layer.get("opacity_min", 1.0))
+    opacity_max = float(layer.get("opacity_max", 1.0))
+    opacity = round(random.uniform(min(opacity_min, opacity_max), max(opacity_min, opacity_max)), 3)
+
+    return {
+        "local_path": tmp_path,
+        "opacity": opacity,
+        "blend_mode": layer.get("blend_mode", "colorkey_black"),
+        "label": layer.get("label", ""),
+    }
 
 
 def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
@@ -2176,6 +2292,7 @@ def process_video_request(
     character_position: str = "random",
     subtitle_color_preset: str = "random",
     effect_overlay_ids: list = None,
+    effect_layers: list = None,
     bg_video_folder_ids: list = None,
     max_bg_clips: int = 10,
     poof_remove_bg: bool = False,
@@ -2248,6 +2365,7 @@ def process_video_request(
             "character_position": character_position,
             "subtitle_color_preset": subtitle_color_preset,
             "effect_overlay_ids": effect_overlay_ids or [],
+            "effect_layers": effect_layers or [],
             "bg_video_folder_ids": bg_video_folder_ids or [],
             "max_bg_clips": max_bg_clips,
             "poof_remove_bg": poof_remove_bg,
