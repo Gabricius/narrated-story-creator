@@ -14,7 +14,6 @@ import requests
 import shelve
 import os
 import atexit
-import signal
 import sys
 import base64
 import json
@@ -842,11 +841,6 @@ for lang, voices in LANGUAGE_VOICE_CONFIG.items():
             LANGUAGE_VOICE_MAP[voice] = LANGUAGE_CONFIG[lang]
         else:
             print(f"Warning: Language {lang} not found in LANGUAGE_CONFIG")
-
-def signal_handler(sig, frame):
-    sys.exit(0)
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
