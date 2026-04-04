@@ -11,6 +11,10 @@ import re
 
 CUDA = os.environ.get('CUDA', '0') == '1'
 
+# ── Subtitle layout constants ──
+SUBTITLE_POS_Y_V2 = int(1080 * 0.675)   # 729px — vertical center of v2 karaoke text
+SUBTITLE_STRIP_TOP = 0.75               # fraction — subtitle strip starts at 75% height (v3/v4)
+
 # ── V4 Subtitle Color Presets ──
 # ASS color format: &HAABBGGRR (alpha, blue, green, red — hex)
 # &H00 prefix = fully opaque
@@ -48,8 +52,6 @@ def _render_dynamic_red_box(
     text_height = text_bbox[3] - text_bbox[1] # Full height of text
     text_y_offset = text_bbox[1] # Y offset for precise vertical centering
     
-    print(f"Text dimensions: {text_width}x{text_height}, Y offset: {text_y_offset}") 
-
     # B) Volume icon dimensions for the box
     vol_icon_image = Image.open(volume_icon_path).convert("RGBA")
     
@@ -254,7 +256,7 @@ def create_overlay_v4(
     draw = ImageDraw.Draw(overlay)
 
     # Subtitle strip: bottom 25%
-    strip_y = int(height * 0.75)  # 810px for 1080p
+    strip_y = int(height * SUBTITLE_STRIP_TOP)  # 810px for 1080p
 
     draw.rectangle([(0, strip_y), (width, height)], fill=subtitle_background_color)
 
@@ -605,7 +607,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """.format(font_size=font_size, font_color=font_color)
     
     # Position at 67.5% from the top is achieved using alignment 8 (center) and \pos tag
-    pos_y = int(1080 * 0.675)
+    pos_y = SUBTITLE_POS_Y_V2
     
     # Process each segment and add to the subtitle file
     for segment in segments:
@@ -635,260 +637,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"Subtitle file created: {output_file}")
     return output_file
 
-def create_subtitle_v2_karaoke(word_captions, output_path, font_size=24, max_chars_per_line=40, max_lines=2):
+def _create_karaoke_ass(
+    word_captions: list,
+    output_path: str,
+    colors: dict,
+    pos_y: int,
+    alignment: int,
+    font_size: int = 80,
+    max_chars_per_line: int = 40,
+    max_lines: int = 2,
+    outline: int = 0,
+    back_colour: str = "&H00000000",
+) -> str:
+    """Core karaoke ASS builder shared by v2 and v4. Returns output_path.
+
+    colors: dict with keys 'unspoken', 'current', 'spoken' (ASS &HAABBGGRR hex strings).
     """
-    Create subtitle with word-by-word karaoke effect for v2
-    
-    Colors:
-    - White (&H00FFFFFF): Default color for words not yet spoken
-    - Green (&H0000FF00): Current word being spoken
-    - Gray (&H00808080): Words already spoken
-    
-    Args:
-        word_captions: List of word tokens with start_ts, end_ts, and text
-        output_path: Path to save the .ass file
-        font_size: Font size for subtitles
-        max_chars_per_line: Maximum characters per line (default: 40)
-        max_lines: Maximum number of lines (default: 2)
-    """
-    
-    # ASS color codes (BGR format in hex)
-    COLOR_WHITE = "&H00FFFFFF"    # Words not yet spoken
-    COLOR_GREEN = "&H0000FF00"    # Current word (being spoken)
-    COLOR_GRAY = "&H00808080"     # Words already spoken
-    
-    # Create the .ass subtitle file with headers
-    ass_content = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{font_size},{COLOR_WHITE},&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,0,8,20,20,20,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
-    
-    # Position at 67.5% from the top
-    pos_y = int(1080 * 0.675)
-    
-    # ── Normalize caption keys (handle both 'start'/'end' and 'start_ts'/'end_ts') ──
-    normalized_captions = []
-    for cap in word_captions:
-        if isinstance(cap, dict):
-            s = cap.get("start_ts", cap.get("start", cap.get("s", 0)))
-            e = cap.get("end_ts", cap.get("end", cap.get("e", 0)))
-            t = cap.get("text", cap.get("word", cap.get("w", "")))
-            normalized_captions.append({"start_ts": float(s), "end_ts": float(e), "text": str(t)})
-        elif hasattr(cap, "start_ts"):
-            normalized_captions.append({"start_ts": float(cap.start_ts), "end_ts": float(cap.end_ts), "text": str(getattr(cap, 'text', getattr(cap, 'word', '')))})
-        elif hasattr(cap, "start"):
-            normalized_captions.append({"start_ts": float(cap.start), "end_ts": float(cap.end), "text": str(getattr(cap, 'text', getattr(cap, 'word', '')))})
-        else:
-            print(f"[KARAOKE] WARNING: Unknown caption format: {type(cap).__name__} = {repr(cap)[:100]}")
-    
-    word_captions = normalized_captions
-    
-    # Merge punctuation with previous words
-    merged_captions = []
-    for i, caption in enumerate(word_captions):
-        text = caption["text"]
-        
-        # Check if this is punctuation
-        if text in string.punctuation and merged_captions:
-            # Merge with previous word
-            merged_captions[-1]["text"] += text
-            merged_captions[-1]["end_ts"] = caption["end_ts"]
-        else:
-            # Add as new word
-            merged_captions.append(caption.copy())
-    
-    # Group words into segments (max 2 lines, respecting character limit)
-    segments = []
-    current_segment = []
-    current_line_words = []
-    current_line_length = 0
-    current_line_num = 0
-    
-    for caption in merged_captions:
-        word = caption["text"]
-        word_length = len(word)
-        
-        # Check if adding this word would exceed line limit
-        potential_length = current_line_length + (1 if current_line_words else 0) + word_length
-        
-        if potential_length > max_chars_per_line and current_line_words:
-            # Line is full, move to next line
-            current_segment.extend(current_line_words)
-            current_line_words = []
-            current_line_length = 0
-            current_line_num += 1
-            
-            # If we've reached max lines, start new segment
-            if current_line_num >= max_lines:
-                segments.append(current_segment)
-                current_segment = []
-                current_line_num = 0
-        
-        # Add word to current line
-        current_line_words.append(caption)
-        current_line_length += (1 if current_line_length > 0 else 0) + word_length
-    
-    # Add remaining words
-    if current_line_words:
-        current_segment.extend(current_line_words)
-    if current_segment:
-        segments.append(current_segment)
-    
-    # Generate ASS events for each segment with word-by-word coloring
-    # CRITICAL: Track segment end times to prevent overlap
-    segment_end_times = []
-    
-    # Pre-process: extend word end times to eliminate gaps (persistent subtitles)
-    # Without this, subtitles disappear during tiny pauses between words
-    for seg_idx, segment_words in enumerate(segments):
-        if not segment_words:
-            continue
-        for w_idx in range(len(segment_words) - 1):
-            # Extend this word's end to the next word's start (within segment)
-            next_start = segment_words[w_idx + 1]["start_ts"]
-            if next_start > segment_words[w_idx]["end_ts"]:
-                segment_words[w_idx]["end_ts"] = next_start
-        
-        # Extend last word of this segment to first word of next segment
-        if seg_idx < len(segments) - 1:
-            next_seg = segments[seg_idx + 1]
-            if next_seg:
-                next_seg_start = next_seg[0]["start_ts"]
-                last_word = segment_words[-1]
-                if next_seg_start > last_word["end_ts"]:
-                    last_word["end_ts"] = next_seg_start
-    
-    for seg_idx, segment_words in enumerate(segments):
-        if not segment_words:
-            continue
-        
-        segment_start = segment_words[0]["start_ts"]
-        segment_end = segment_words[-1]["end_ts"]
-        
-        # If this is not the first segment, ensure it starts EXACTLY when previous ends
-        if seg_idx > 0 and segment_end_times:
-            previous_end = segment_end_times[-1]
-            if segment_start < previous_end:
-                time_shift = previous_end - segment_words[0]["start_ts"]
-                for word_data in segment_words:
-                    word_data["start_ts"] += time_shift
-                    word_data["end_ts"] += time_shift
-                segment_start = segment_words[0]["start_ts"]
-                segment_end = segment_words[-1]["end_ts"]
-        
-        # Break segment into lines for display (max 2 lines)
-        lines = []
-        current_line = []
-        current_length = 0
-        
-        for word_data in segment_words:
-            word = word_data["text"]
-            word_length = len(word)
-            potential_length = current_length + (1 if current_line else 0) + word_length
-            
-            if potential_length > max_chars_per_line and current_line:
-                lines.append(current_line)
-                current_line = []
-                current_length = 0
-            
-            current_line.append(word_data)
-            current_length += (1 if current_length > 0 else 0) + word_length
-        
-        if current_line:
-            lines.append(current_line)
-        
-        lines = lines[:max_lines]
-        
-        # ── TRANSITION-BASED EVENTS (zero gaps guaranteed) ──
-        # Instead of one event per word, create events based on TRANSITIONS.
-        # Each event spans from one word's start to the next word's start.
-        # This eliminates gaps from breathing pauses or TTS timing artifacts.
-        #
-        # Event 0: segment_start → word[1].start  (word 0 = green)
-        # Event 1: word[1].start → word[2].start  (word 1 = green)
-        # ...
-        # Event N: word[N].start → segment_end    (word N = green)
-        
-        for word_idx, current_word in enumerate(segment_words):
-            # Event start: this word's start_ts
-            event_start = current_word["start_ts"]
-            
-            # Event end: next word's start_ts, or segment_end for last word
-            if word_idx < len(segment_words) - 1:
-                event_end = segment_words[word_idx + 1]["start_ts"]
-            else:
-                event_end = segment_end
-            
-            # Safety: ensure minimum duration
-            if event_end <= event_start:
-                event_end = event_start + 0.05
-            
-            # Build the multi-line text with color tags
-            colored_lines = []
-            
-            for line_words in lines:
-                colored_line = ""
-                for word_data in line_words:
-                    word_text = word_data["text"]
-                    
-                    word_index_in_segment = segment_words.index(word_data)
-                    
-                    if word_index_in_segment < word_idx:
-                        colored_line += f"{{\\c{COLOR_GRAY}}}{word_text}{{\\c}}"
-                    elif word_index_in_segment == word_idx:
-                        colored_line += f"{{\\c{COLOR_GREEN}}}{word_text}{{\\c}}"
-                    else:
-                        colored_line += f"{{\\c{COLOR_WHITE}}}{word_text}{{\\c}}"
-                    
-                    if word_data != line_words[-1]:
-                        colored_line += " "
-                
-                colored_lines.append(colored_line)
-            
-            formatted_text = "\\N".join(colored_lines)
-            formatted_text = f"{{\\pos(960,{pos_y})}}" + formatted_text
-            
-            start_time = format_time(event_start)
-            end_time = format_time(event_end)
-            
-            ass_content += f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{formatted_text}\n"
-        
-        # Track this segment's end time
-        segment_end_times.append(segment_end)
-    
-    # Write the subtitle file
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(ass_content)
-    
-    print(f"V2 Karaoke subtitle file created: {output_path}")
-    return output_path
-
-
-def create_subtitle_v4_karaoke(word_captions, output_path, color_preset, font_size=80,
-                                max_chars_per_line=40, max_lines=2):
-    """V4 karaoke subtitle: colored word-by-word highlight over the bottom-25% subtitle strip.
-
-    color_preset: dict from COLOR_PRESETS, e.g.:
-        {"name": "yellow", "current": "&H0000FFFF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"}
-
-    Subtitle strip occupies y=810..1080 on a 1080p canvas.
-    Text is positioned at the vertical center of the strip (y=945) with Alignment=5.
-    No outline — the semi-transparent strip provides the background.
-    """
-    COLOR_UNSPOKEN = color_preset["unspoken"]
-    COLOR_CURRENT  = color_preset["current"]
-    COLOR_SPOKEN   = color_preset["spoken"]
-
-    # Center of the subtitle strip: 810 + (1080-810)/2 = 945
-    pos_y = 945
+    COLOR_UNSPOKEN = colors["unspoken"]
+    COLOR_CURRENT  = colors["current"]
+    COLOR_SPOKEN   = colors["spoken"]
 
     ass_content = f"""[Script Info]
 ScriptType: v4.00+
@@ -897,7 +664,7 @@ PlayResY: 1080
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{font_size},{COLOR_UNSPOKEN},&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,5,20,20,20,1
+Style: Default,Arial,{font_size},{COLOR_UNSPOKEN},&H000000FF,&H00000000,{back_colour},-1,0,0,0,100,100,0,0,1,{outline},0,{alignment},20,20,20,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -917,9 +684,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         elif hasattr(cap, "start"):
             normalized_captions.append({"start_ts": float(cap.start), "end_ts": float(cap.end),
                                          "text": str(getattr(cap, "text", getattr(cap, "word", "")))})
+        else:
+            print(f"[KARAOKE] WARNING: Unknown caption format: {type(cap).__name__} = {repr(cap)[:100]}")
     word_captions = normalized_captions
 
-    # ── Merge punctuation ──
+    # ── Merge punctuation with previous word ──
     merged = []
     for cap in word_captions:
         if cap["text"] in string.punctuation and merged:
@@ -928,35 +697,37 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             merged.append(cap.copy())
 
-    # ── Group into segments (2 lines, max chars/line) ──
+    # ── Group into segments (max_lines × max_chars_per_line) ──
     segments = []
-    current_seg = []
-    current_line_words = []
-    current_line_len = 0
-    current_line_num = 0
+    cur_seg = []
+    cur_line_words = []
+    cur_line_len = 0
+    cur_line_num = 0
 
     for cap in merged:
         word = cap["text"]
-        potential = current_line_len + (1 if current_line_words else 0) + len(word)
-        if potential > max_chars_per_line and current_line_words:
-            current_seg.extend(current_line_words)
-            current_line_words = []
-            current_line_len = 0
-            current_line_num += 1
-            if current_line_num >= max_lines:
-                segments.append(current_seg)
-                current_seg = []
-                current_line_num = 0
-        current_line_words.append(cap)
-        current_line_len += (1 if current_line_len > 0 else 0) + len(word)
+        potential = cur_line_len + (1 if cur_line_words else 0) + len(word)
+        if potential > max_chars_per_line and cur_line_words:
+            cur_seg.extend(cur_line_words)
+            cur_line_words = []
+            cur_line_len = 0
+            cur_line_num += 1
+            if cur_line_num >= max_lines:
+                segments.append(cur_seg)
+                cur_seg = []
+                cur_line_num = 0
+        cur_line_words.append(cap)
+        cur_line_len += (1 if cur_line_len > 0 else 0) + len(word)
 
-    if current_line_words:
-        current_seg.extend(current_line_words)
-    if current_seg:
-        segments.append(current_seg)
+    if cur_line_words:
+        cur_seg.extend(cur_line_words)
+    if cur_seg:
+        segments.append(cur_seg)
 
-    # ── Extend word end times to eliminate gaps ──
+    # ── Extend word end times to eliminate gaps (persistent subtitles) ──
     for seg_idx, seg_words in enumerate(segments):
+        if not seg_words:
+            continue
         for w_idx in range(len(seg_words) - 1):
             nxt = seg_words[w_idx + 1]["start_ts"]
             if nxt > seg_words[w_idx]["end_ts"]:
@@ -1004,7 +775,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             lines.append(cur_line)
         lines = lines[:max_lines]
 
-        # ── Transition-based events ──
+        # O(n) position lookup: avoids O(n²) list.index() inside nested loops
+        word_pos = {id(wd): i for i, wd in enumerate(seg_words)}
+
         for word_idx, cur_word in enumerate(seg_words):
             ev_start = cur_word["start_ts"]
             ev_end   = seg_words[word_idx + 1]["start_ts"] if word_idx < len(seg_words) - 1 else seg_end
@@ -1015,7 +788,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for line_words in lines:
                 colored_line = ""
                 for wd in line_words:
-                    idx_in_seg = seg_words.index(wd)
+                    idx_in_seg = word_pos[id(wd)]
                     if idx_in_seg < word_idx:
                         colored_line += f"{{\\c{COLOR_SPOKEN}}}{wd['text']}{{\\c}}"
                     elif idx_in_seg == word_idx:
@@ -1028,7 +801,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
             formatted = "\\N".join(colored_lines)
             formatted  = f"{{\\pos(960,{pos_y})}}" + formatted
-
             ass_content += (f"Dialogue: 0,{format_time(ev_start)},{format_time(ev_end)},"
                             f"Default,,0,0,0,,{formatted}\n")
 
@@ -1037,8 +809,42 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
 
-    print(f"V4 karaoke subtitle created: {output_path} | preset={color_preset['name']}")
     return output_path
+
+
+def create_subtitle_v2_karaoke(word_captions, output_path, font_size=24, max_chars_per_line=40, max_lines=2):
+    """Karaoke subtitle for v2: green current word, white unspoken, gray spoken."""
+    colors = {"unspoken": "&H00FFFFFF", "current": "&H0000FF00", "spoken": "&H00808080"}
+    result = _create_karaoke_ass(
+        word_captions, output_path, colors,
+        pos_y=SUBTITLE_POS_Y_V2, alignment=8,
+        font_size=font_size, max_chars_per_line=max_chars_per_line, max_lines=max_lines,
+        outline=2, back_colour="&H80000000",
+    )
+    print(f"V2 Karaoke subtitle file created: {output_path}")
+    return result
+
+
+def create_subtitle_v4_karaoke(word_captions, output_path, color_preset, font_size=80,
+                                max_chars_per_line=40, max_lines=2):
+    """V4 karaoke subtitle: colored word-by-word highlight over the bottom-25% subtitle strip.
+
+    color_preset: dict from COLOR_PRESETS, e.g.:
+        {"name": "yellow", "current": "&H0000FFFF", "unspoken": "&H00FFFFFF", "spoken": "&H00808080"}
+    """
+    colors = {
+        "unspoken": color_preset["unspoken"],
+        "current":  color_preset["current"],
+        "spoken":   color_preset["spoken"],
+    }
+    result = _create_karaoke_ass(
+        word_captions, output_path, colors,
+        pos_y=945, alignment=5,
+        font_size=font_size, max_chars_per_line=max_chars_per_line, max_lines=max_lines,
+        outline=0, back_colour="&H00000000",
+    )
+    print(f"V4 karaoke subtitle created: {output_path} | preset={color_preset['name']}")
+    return result
 
 
 def format_time(seconds):
@@ -1272,11 +1078,10 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
             pass
         
         if return_code != 0:
-            print(f"ffmpeg exited with code: {return_code}")
-            return False
-        
+            raise RuntimeError(f"FFmpeg exited with code {return_code}")
+
         return True
-        
+
     except Exception as e:
         print(f"Error during video rendering: {e}")
         # Cleanup on error too
@@ -1285,7 +1090,7 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
                 os.remove(concat_list_path)
         except:
             pass
-        return False
+        raise
 
 
 def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_path,
@@ -1486,14 +1291,13 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         return_code = process.wait()
 
         if return_code != 0:
-            print(f"[RENDER-V4] ffmpeg exited with code {return_code}")
-            return False
+            raise RuntimeError(f"[RENDER-V4] FFmpeg exited with code {return_code}")
 
         return True
 
     except Exception as e:
         print(f"[RENDER-V4] Error: {e}")
-        return False
+        raise
 
     finally:
         for cp in ([concat_list_path] + effect_concat_paths):
