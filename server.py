@@ -316,7 +316,8 @@ import wave
 # CHUNKED TTS — Process large texts in pieces to avoid OOM
 # ═══════════════════════════════
 
-TTS_CHUNK_CHARS = 1500  # Max chars per TTS chunk (~1.5 min audio each, safer for low RAM)
+TTS_CHUNK_CHARS = int(os.environ.get("TTS_CHUNK_CHARS", "1500"))  # Max chars per TTS chunk
+FONT_PATH = os.environ.get("FONT_PATH", "assets/noto.ttf")
 
 def get_memory_mb():
     """Get current process memory usage in MB."""
@@ -945,7 +946,7 @@ def process_video_queue():
                     
                     overlay_path = os.path.join(video_dir, "overlay.png")
                     print("creating overlay")
-                    font_path = "assets/noto.ttf"
+                    font_path = FONT_PATH
                     if LANGUAGE_VOICE_MAP[data["voice"]]["lang_code"] == "h":
                         font_path = "assets/noto_hindi.ttf"
                     
@@ -1109,11 +1110,16 @@ def process_video_queue():
                     print("rendering video")
                     _prod_id = data.get("production_id", "")
                     _render_start = time.time()
+                    _last_progress_ts = [0.0]  # mutable cell for closure
                     def _render_progress(pct):
+                        now = time.time()
+                        if now - _last_progress_ts[0] < 5.0:
+                            return
+                        _last_progress_ts[0] = now
                         update_production_progress(_prod_id, {
                             "stage": "render",
                             "pct": pct,
-                            "elapsed_s": round(time.time() - _render_start, 1),
+                            "elapsed_s": round(now - _render_start, 1),
                         })
 
                     if version == "v4":
@@ -1124,7 +1130,7 @@ def process_video_queue():
                                 folder_ids=folder_ids,
                                 max_clips=data.get("max_bg_clips", 10),
                                 video_dir=video_dir,
-                            )
+                            ) or [bg_video_path]  # fallback to static bg if rclone fails
                         else:
                             bg_paths = [bg_video_path]
 
@@ -1227,9 +1233,23 @@ def process_video_queue():
                         shutil.rmtree(video_dir)
                 except:
                     pass
-
-load_videos()
-worker_thread = threading.Thread(target=process_video_queue, daemon=True)
+                # Best-effort: log error_message to Supabase productions table
+                prod_id = locals().get('_prod_id') or (videos.get(video_id, {}).get('data', {}).get('production_id', ''))
+                if prod_id and SUPABASE_URL and SUPABASE_SERVICE_KEY:
+                    try:
+                        requests.patch(
+                            f"{SUPABASE_URL}/rest/v1/productions?id=eq.{prod_id}",
+                            headers={
+                                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                                "apikey": SUPABASE_SERVICE_KEY,
+                                "Content-Type": "application/json",
+                                "Prefer": "return=minimal",
+                            },
+                            json={"error_message": str(e)[:500]},
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass
 
 ### REST API ###
 @app.get("/health")
@@ -1288,25 +1308,28 @@ def create_video(video: dict):
     if error:
         return {"error": error}
     
-    videos[video_id] = video_data
+    with worker_lock:
+        videos[video_id] = video_data
     save_videos()
     video_queue.put(video_id)
     return {"video_id": video_id, "status": VideoStatus.QUEUED}
 
 @app.get("/api/videos/{video_id}/status")
 def get_video(video_id: str):
-    if video_id in videos:
-        result = {"video_id": video_id, "status": videos[video_id]["status"]}
-        vid_data = videos[video_id].get("data", {})
+    with worker_lock:
+        vid_entry = videos.get(video_id)
+    if vid_entry is not None:
+        result = {"video_id": video_id, "status": vid_entry["status"]}
+        vid_data = vid_entry.get("data", {})
         if "video_render_duration_seconds" in vid_data:
             result["video_render_duration_seconds"] = vid_data["video_render_duration_seconds"]
         if "video_editing_version" in vid_data:
             result["video_editing_version"] = vid_data["video_editing_version"]
         if "video_duration_seconds" in vid_data:
             result["video_duration_seconds"] = vid_data["video_duration_seconds"]
-            
-        if videos[video_id]["status"] == VideoStatus.COMPLETED:
-            drive_url = videos[video_id].get("drive_url")
+
+        if vid_entry["status"] == VideoStatus.COMPLETED:
+            drive_url = vid_entry.get("drive_url")
             if drive_url:
                 result["video_url"] = drive_url
                 result["storage"] = "drive"
@@ -1348,17 +1371,18 @@ def download_video(video_id: str, download: bool = False):
 @app.delete("/api/videos/{video_id}")
 def delete_video(video_id: str):
     """Delete video file and metadata. Called by n8n after uploading to Google Drive."""
-    if video_id in videos:
-        video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
-        freed = 0
-        if os.path.exists(video_path):
-            freed = os.path.getsize(video_path)
-            os.remove(video_path)
-            print(f"[DISK] Deleted {video_id}: {freed / 1024 / 1024:.1f} MB freed")
+    with worker_lock:
+        if video_id not in videos:
+            return {"video_id": video_id, "status": VideoStatus.NOT_FOUND}
         del videos[video_id]
-        save_videos()
-        return {"video_id": video_id, "status": VideoStatus.DELETED, "freed_mb": round(freed / 1024 / 1024, 1)}
-    return {"video_id": video_id, "status": VideoStatus.NOT_FOUND}
+    video_path = os.path.join(VIDEOS_DIR, f"{video_id}.mp4")
+    freed = 0
+    if os.path.exists(video_path):
+        freed = os.path.getsize(video_path)
+        os.remove(video_path)
+        print(f"[DISK] Deleted {video_id}: {freed / 1024 / 1024:.1f} MB freed")
+    save_videos()
+    return {"video_id": video_id, "status": VideoStatus.DELETED, "freed_mb": round(freed / 1024 / 1024, 1)}
 
 @app.get("/api/disk")
 def disk_status():
@@ -1751,8 +1775,14 @@ else:
 # V4 HELPERS
 # ═══════════════════════════════
 
+_SYSTEM_CONFIG_CACHE: dict = {}  # { key: (value, timestamp) }
+_SYSTEM_CONFIG_TTL = 300  # 5 minutes
+
 def get_system_config(key: str) -> str | None:
-    """Fetch a value from the system_config table in Supabase."""
+    """Fetch a value from the system_config table in Supabase (5-min in-memory cache)."""
+    cached = _SYSTEM_CONFIG_CACHE.get(key)
+    if cached and time.time() - cached[1] < _SYSTEM_CONFIG_TTL:
+        return cached[0]
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return None
     try:
@@ -1766,7 +1796,9 @@ def get_system_config(key: str) -> str | None:
         )
         data = resp.json()
         if data and isinstance(data, list) and len(data) > 0:
-            return data[0]["value"]
+            value = data[0]["value"]
+            _SYSTEM_CONFIG_CACHE[key] = (value, time.time())
+            return value
     except Exception as e:
         print(f"[V4] get_system_config({key}) failed: {e}")
     return None
@@ -1786,7 +1818,11 @@ def remove_background_poof(image_path: str, poof_api_key: str) -> str:
             data={"format": "png", "size": "full"},
             timeout=60,
         )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception as http_err:
+        print(f"[POOF] HTTP error: {http_err} | status={resp.status_code} | body={resp.text[:200]}")
+        raise
 
     img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
     bbox = img.getbbox()
@@ -1800,40 +1836,48 @@ def remove_background_poof(image_path: str, poof_api_key: str) -> str:
 
 
 def select_bg_videos(folder_ids: list, max_clips: int, video_dir: str) -> list:
-    """Pick random folder, list .mp4s via rclone, download up to max_clips."""
+    """Pick random folder, list .mp4s via rclone, download up to max_clips.
+
+    Returns [] on any rclone failure so the caller can fall back to the static bg video.
+    """
     import subprocess as _sp
 
-    folder_id = random.choice(folder_ids)
-    print(f"[V4] select_bg_videos: listing folder {folder_id}")
+    try:
+        folder_id = random.choice(folder_ids)
+        print(f"[V4] select_bg_videos: listing folder {folder_id}")
 
-    result = _sp.run(
-        [
-            "rclone", "lsjson",
-            f"{RCLONE_REMOTE}:",
-            "--drive-root-folder-id", folder_id,
-            "--include", "*.mp4",
-        ],
-        capture_output=True, text=True, timeout=60,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"rclone lsjson failed: {result.stderr[:300]}")
-
-    files = json.loads(result.stdout)
-    random.shuffle(files)
-    selected = files[:max_clips]
-    print(f"[V4] select_bg_videos: {len(files)} found, downloading {len(selected)}")
-
-    local_paths = []
-    for f in selected:
-        out = os.path.join(video_dir, f"bg_{f['ID']}.mp4")
-        _sp.run(
-            ["rclone", "backend", "copyid", f"{RCLONE_REMOTE}:", f["ID"], out],
-            check=True, timeout=120,
+        result = _sp.run(
+            [
+                "rclone", "lsjson",
+                f"{RCLONE_REMOTE}:",
+                "--drive-root-folder-id", folder_id,
+                "--include", "*.mp4",
+            ],
+            capture_output=True, text=True, timeout=60,
         )
-        local_paths.append(out)
-        print(f"[V4] Downloaded bg clip: {f.get('Name', f['ID'])}")
+        if result.returncode != 0:
+            print(f"[V4] rclone lsjson failed (code {result.returncode}): {result.stderr[:200]}")
+            return []
 
-    return local_paths
+        files = json.loads(result.stdout)
+        random.shuffle(files)
+        selected = files[:max_clips]
+        print(f"[V4] select_bg_videos: {len(files)} found, downloading {len(selected)}")
+
+        local_paths = []
+        for f in selected:
+            out = os.path.join(video_dir, f"bg_{f['ID']}.mp4")
+            _sp.run(
+                ["rclone", "backend", "copyid", f"{RCLONE_REMOTE}:", f["ID"], out],
+                check=True, timeout=120,
+            )
+            local_paths.append(out)
+            print(f"[V4] Downloaded bg clip: {f.get('Name', f['ID'])}")
+
+        return local_paths
+    except Exception as e:
+        print(f"[V4] select_bg_videos error: {e}")
+        return []
 
 
 def get_effect_layers(data: dict) -> list:
