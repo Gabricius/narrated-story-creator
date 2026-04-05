@@ -928,11 +928,15 @@ def process_video_queue():
                     os.makedirs(video_dir, exist_ok=True)
                     
                     try:
-                        # Download background video
-                        print(f"Downloading background video for {video_id}")
+                        # Download background video — skip for v4 with folder_ids (clips selected later)
                         bg_video_path = os.path.join(video_dir, "background.mp4")
-                        download_drive_file(data["bg_video_url"], bg_video_path, timeout=120)
-                        
+                        _is_v4_folders = (data.get("version") == "v4" and data.get("bg_video_folder_ids"))
+                        if not _is_v4_folders:
+                            print(f"Downloading background video for {video_id}")
+                            download_drive_file(data["bg_video_url"], bg_video_path, timeout=120)
+                        else:
+                            print(f"[V4] Skipping static bg download for {video_id} — will use bg_video_folder_ids")
+
                         # Download person image
                         print(f"Downloading person image for {video_id}")
                         person_image_path = os.path.join(video_dir, "person.png")
@@ -1130,7 +1134,13 @@ def process_video_queue():
                                 folder_ids=folder_ids,
                                 max_clips=data.get("max_bg_clips", 10),
                                 video_dir=video_dir,
-                            ) or [bg_video_path]  # fallback to static bg if rclone fails
+                            ) or ([bg_video_path] if os.path.exists(bg_video_path) else [])
+                            if not bg_paths:
+                                raise RuntimeError(
+                                    f"[V4] No background clips available: select_bg_videos returned empty "
+                                    f"and bg_video_path does not exist at {bg_video_path}. "
+                                    f"Check that bg_video_folder_ids are valid Drive folders accessible via rclone."
+                                )
                         else:
                             bg_paths = [bg_video_path]
 
@@ -1629,8 +1639,8 @@ def create_test_video(params: dict = {}):
     effect_overlay_ids = params.get("effect_overlay_ids", [])
     max_bg_clips = int(params.get("max_bg_clips", 10))
 
-    if not bg_video_url:
-        return JSONResponse(content={"error": "bg_video_url is required"}, status_code=400)
+    if not bg_video_url and not bg_video_folder_ids:
+        return JSONResponse(content={"error": "bg_video_url or bg_video_folder_ids is required"}, status_code=400)
     
     # Build test text that creates multiple TTS chunks
     # Each chunk ~1500 chars, so 2 chunks = ~3000 chars, 3 chunks = ~4500 chars
@@ -2354,8 +2364,8 @@ def process_video_request(
     # Trusted domains — skip HEAD validation (Google Drive doesn't handle HEAD well)
     TRUSTED_DOMAINS = ["drive.google.com", "googleapis.com", "supabase.co", "cloudflare", "easypanel.host"]
 
-    # Check background video
-    if not any(d in bg_video_url for d in TRUSTED_DOMAINS):
+    # Check background video (skip entirely for v4 with folder_ids)
+    if bg_video_url and not any(d in bg_video_url for d in TRUSTED_DOMAINS):
         try:
             response = requests.head(bg_video_url, timeout=10, allow_redirects=True)
             if response.status_code not in [200, 302, 303]:
@@ -2365,8 +2375,10 @@ def process_video_request(
                 return None, None, "Invalid bg_video_url: should be a video file"
         except Exception as e:
             return None, None, f"Error checking bg_video_url: {str(e)}"
-    else:
+    elif bg_video_url:
         print(f"[VALIDATE] Skipping HEAD check for trusted domain: {bg_video_url[:60]}...")
+    else:
+        print(f"[VALIDATE] Skipping bg_video_url check — not provided (v4 folder mode)")
 
     # Check person image
     if not any(d in person_image_url for d in TRUSTED_DOMAINS):
