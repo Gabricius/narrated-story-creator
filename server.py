@@ -2364,8 +2364,8 @@ def process_video_request(
     # Trusted domains — skip HEAD validation (Google Drive doesn't handle HEAD well)
     TRUSTED_DOMAINS = ["drive.google.com", "googleapis.com", "supabase.co", "cloudflare", "easypanel.host"]
 
-    # Check background video (skip entirely for v4 with folder_ids)
-    if bg_video_url and not any(d in bg_video_url for d in TRUSTED_DOMAINS):
+    # Check background video (skip entirely for v4 with folder_ids, even if bg_video_url is set)
+    if bg_video_url and not bg_video_folder_ids and not any(d in bg_video_url for d in TRUSTED_DOMAINS):
         try:
             response = requests.head(bg_video_url, timeout=10, allow_redirects=True)
             if response.status_code not in [200, 302, 303]:
@@ -2375,10 +2375,10 @@ def process_video_request(
                 return None, None, "Invalid bg_video_url: should be a video file"
         except Exception as e:
             return None, None, f"Error checking bg_video_url: {str(e)}"
-    elif bg_video_url:
+    elif bg_video_url and not bg_video_folder_ids:
         print(f"[VALIDATE] Skipping HEAD check for trusted domain: {bg_video_url[:60]}...")
     else:
-        print(f"[VALIDATE] Skipping bg_video_url check — not provided (v4 folder mode)")
+        print(f"[VALIDATE] Skipping bg_video_url check — v4 folder mode (bg_video_folder_ids={len(bg_video_folder_ids or [])})")
 
     # Check person image
     if not any(d in person_image_url for d in TRUSTED_DOMAINS):
