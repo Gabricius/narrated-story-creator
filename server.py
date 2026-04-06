@@ -921,9 +921,10 @@ def process_video_queue():
                 worker_start_time = time.time()
                 video_id = video_queue.get()
                 if video_id in videos:
-                    videos[video_id]["status"] = VideoStatus.PROCESSING
+                    with worker_lock:
+                        videos[video_id]["status"] = VideoStatus.PROCESSING
+                        data = videos[video_id]["data"]
                     save_videos()
-                    data = videos[video_id]["data"]
                     video_dir = os.path.join(TMP_DIR, video_id)
                     os.makedirs(video_dir, exist_ok=True)
                     
@@ -1212,19 +1213,21 @@ def process_video_queue():
                     if rclone_available() and folder_id:
                         drive_url = rclone_upload_video(video_path, f"{video_id}.mp4", folder_id=folder_id)
                         if drive_url:
-                            videos[video_id]["drive_url"] = drive_url
                             # Delete local file to save disk
                             try:
                                 os.remove(video_path)
                                 print(f"[DISK] Deleted local: {video_path}")
                             except:
                                 pass
-                    
+
                     worker_duration = int(time.time() - worker_start_time)
-                    videos[video_id]["data"]["video_render_duration_seconds"] = worker_duration
-                    videos[video_id]["data"]["video_editing_version"] = data.get("version", "v1")
-                    videos[video_id]["data"]["video_duration_seconds"] = int(audio_length)
-                    videos[video_id]["status"] = VideoStatus.COMPLETED
+                    with worker_lock:
+                        if drive_url:
+                            videos[video_id]["drive_url"] = drive_url
+                        videos[video_id]["data"]["video_render_duration_seconds"] = worker_duration
+                        videos[video_id]["data"]["video_editing_version"] = data.get("version", "v1")
+                        videos[video_id]["data"]["video_duration_seconds"] = int(audio_length)
+                        videos[video_id]["status"] = VideoStatus.COMPLETED
                     save_videos()
                     gc.collect()
                     print(f"Completed video: {video_id} | Storage: {('Drive: ' + drive_url) if drive_url else 'local'}")
@@ -1235,8 +1238,9 @@ def process_video_queue():
         except Exception as e:
             print(f"Error in worker thread: {e}")
             if 'video_id' in locals() and video_id in videos:
-                videos[video_id]["status"] = VideoStatus.FAILED
-                videos[video_id]["error"] = str(e)
+                with worker_lock:
+                    videos[video_id]["status"] = VideoStatus.FAILED
+                    videos[video_id]["error"] = str(e)
                 save_videos()
                 try:
                     if 'video_dir' in locals():
