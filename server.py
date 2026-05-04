@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import requests
+from concurrent.futures import ThreadPoolExecutor
 import shelve
 import os
 import atexit
@@ -1710,18 +1711,22 @@ def create_test_video(params: dict = {}):
         "note": f"~{num_chunks * 30}s video with {num_chunks} TTS chunks"
     }
 
-### ImageFX (Google AI Image Generation) ###
-# Based on: https://github.com/rohitaryal/imageFX-api
-# Auth flow: cookie → labs.google/fx/api/auth/session → access_token → aisandbox API
-IMAGEFX_API_URL = "https://aisandbox-pa.googleapis.com/v1:runImageFx"
-IMAGEFX_SESSION_URL = "https://labs.google/fx/api/auth/session"
+### Google Flow (NanoBanana 2 / Pro) Image Generation ###
+# Replaces ImageFX (descontinuado). Auth flow:
+#   cookie → labs.google/fx/api/auth/session → access_token (Bearer)
+# Plus reCAPTCHA Enterprise token (fornecido pela flow-token-extension Chrome).
+FLOW_API_URL_TEMPLATE = "https://aisandbox-pa.googleapis.com/v1/projects/{project_id}/flowMedia:batchGenerateImages"
+FLOW_SESSION_URL = "https://labs.google/fx/api/auth/session"
+FLOW_IMAGES_DIR = os.path.join(os.getcwd(), "flow_output")
+os.makedirs(FLOW_IMAGES_DIR, exist_ok=True)
+# Mantido para servir imagens legacy já cacheadas em disco
 IMAGEFX_IMAGES_DIR = os.path.join(os.getcwd(), "imagefx_output")
 os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 
 # Supabase Storage for persistent image storage
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-IMAGEFX_BUCKET = "imagefx"
+IMAGEFX_BUCKET = "imagefx"  # mantido (URLs já em produção apontam para este bucket)
 
 def update_production_progress(production_id: str, progress: dict):
     """Update processing_progress JSONB on the productions row in Supabase.
@@ -2028,265 +2033,510 @@ def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
         print(f"[ImageFX] Supabase upload error: {e}")
         return None
 
-IMAGEFX_DEFAULT_HEADERS = {
+FLOW_DEFAULT_HEADERS = {
+    "Content-Type": "text/plain;charset=UTF-8",  # importante: evita CORS preflight (body é JSON)
+    "Referer": "https://labs.google/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
     "Origin": "https://labs.google",
-    "Content-Type": "application/json",
-    "Referer": "https://labs.google/fx/tools/image-fx",
+    "Accept": "*/*",
 }
 
+# Aspect ratio: aceita "16:9"/"9:16"/etc + aliases legacy "PORTRAIT"/"LANDSCAPE"/"SQUARE"
 ASPECT_RATIO_MAP = {
+    "16:9": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+    "4:3": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
+    "1:1": "IMAGE_ASPECT_RATIO_SQUARE",
+    "3:4": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
+    "9:16": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    # legacy
     "LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
     "PORTRAIT": "IMAGE_ASPECT_RATIO_PORTRAIT",
     "SQUARE": "IMAGE_ASPECT_RATIO_SQUARE",
     "LANDSCAPE_4_3": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
 }
 
+# Modelo: nome interno do payload Flow
+MODEL_MAP = {
+    "nano_banana_2": "NARWHAL",
+    "nano_banana_pro": "GEM_PIX_2",
+}
 
-def imagefx_get_token(cookie: str) -> dict:
-    """Exchange session cookie for access token via labs.google.
-    
-    Returns: { "access_token": "ya29...", "expires": "...", "user": {...} }
-    Raises: Exception on failure
+# Pool de tokens reCAPTCHA Enterprise alimentado pela flow-token-extension Chrome.
+# Cada token é tipicamente single-use no servidor e válido por ~120s.
+_recaptcha_pool: list[dict] = []
+_recaptcha_pool_lock = threading.Lock()
+_RECAPTCHA_POOL_MAX = 12
+_RECAPTCHA_TTL = 110.0  # margem antes da expiração real (~120s)
+
+
+def _flow_get_project_id() -> str:
+    """Buscar flow_project_id em system_config; fallback para constante."""
+    DEFAULT = "9fc28b8b-d679-47db-8142-0befe8f2a15a"
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return DEFAULT
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/system_config?key=eq.flow_project_id&select=value",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+            },
+            timeout=5,
+        )
+        if resp.ok:
+            rows = resp.json()
+            if rows and rows[0].get("value"):
+                return rows[0]["value"]
+    except Exception:
+        pass
+    return DEFAULT
+
+
+def _consume_recaptcha_tokens(n: int) -> list[str]:
+    """Tira até N tokens não-usados não-expirados do pool. Mais recentes primeiro."""
+    now = time.time()
+    out: list[str] = []
+    with _recaptcha_pool_lock:
+        for entry in reversed(_recaptcha_pool):
+            if entry["used"]:
+                continue
+            if now - entry["received_at"] >= _RECAPTCHA_TTL:
+                continue
+            entry["used"] = True
+            out.append(entry["token"])
+            if len(out) >= n:
+                break
+    return out
+
+
+def _wait_for_recaptcha_tokens(n: int, timeout: float = 30.0) -> list[str]:
+    """Pede N tokens; espera até timeout enquanto a extension entrega novos."""
+    deadline = time.time() + timeout
+    tokens = _consume_recaptcha_tokens(n)
+    while len(tokens) < n and time.time() < deadline:
+        time.sleep(1.0)
+        more = _consume_recaptcha_tokens(n - len(tokens))
+        tokens.extend(more)
+    return tokens
+
+
+@app.post("/api/flow-token-set")
+def flow_token_set(req: dict):
+    """Endpoint chamado pela flow-token-extension a cada token reCAPTCHA novo."""
+    token = (req.get("token") or "").strip()
+    if not token:
+        return JSONResponse(content={"error": "empty token"}, status_code=400)
+    with _recaptcha_pool_lock:
+        _recaptcha_pool.append({"token": token, "received_at": time.time(), "used": False})
+        # Trim pool: descartar usados e expirados, manter no máx _RECAPTCHA_POOL_MAX recentes
+        now = time.time()
+        _recaptcha_pool[:] = [
+            e for e in _recaptcha_pool
+            if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL
+        ][-_RECAPTCHA_POOL_MAX:]
+        pool_size = len(_recaptcha_pool)
+    return {"success": True, "pool_size": pool_size}
+
+
+@app.get("/api/flow-token-status")
+def flow_token_status():
+    """UI consulta para mostrar estado do pool."""
+    now = time.time()
+    with _recaptcha_pool_lock:
+        valid = [e for e in _recaptcha_pool if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL]
+        most_recent = max((e["received_at"] for e in _recaptcha_pool), default=0)
+    return {
+        "pool_size": len(valid),
+        "total_tracked": len(_recaptcha_pool),
+        "most_recent_age_seconds": (now - most_recent) if most_recent else None,
+        "has_fresh_tokens": len(valid) > 0,
+    }
+
+
+def flow_get_token(cookie: str) -> dict:
+    """Trocar session cookie por access_token via labs.google.
+
+    Igual ImageFX (mesmo endpoint). Retorna { access_token, expires, user{...} }.
     """
-    # Sanitize cookie: remove newlines, collapse spaces, trim
     cookie = cookie.replace("\r", "").replace("\n", " ").strip()
-    cookie = re.sub(r'\s+', ' ', cookie)
-    
-    # Don't send Content-Type on GET — some servers reject it
+    cookie = re.sub(r"\s+", " ", cookie)
+
     headers = {
         "Origin": "https://labs.google",
-        "Referer": "https://labs.google/fx/tools/image-fx",
+        "Referer": "https://labs.google/",
         "Cookie": cookie,
     }
-    
-    print(f"[ImageFX] Token exchange — cookie length: {len(cookie)} chars, first 80: {cookie[:80]}...")
-    resp = requests.get(IMAGEFX_SESSION_URL, headers=headers, timeout=15)
-    
+
+    print(f"[Flow] Token exchange — cookie length: {len(cookie)} chars, first 80: {cookie[:80]}...")
+    resp = requests.get(FLOW_SESSION_URL, headers=headers, timeout=15)
+
     if not resp.ok:
-        print(f"[ImageFX] Session failed: HTTP {resp.status_code} — {resp.text[:300]}")
+        print(f"[Flow] Session failed: HTTP {resp.status_code} — {resp.text[:300]}")
         raise Exception(f"Session auth failed (HTTP {resp.status_code}): {resp.text[:300]}")
-    
+
     data = resp.json()
     if not data.get("access_token") or not data.get("expires"):
         raise Exception(f"Session response missing access_token/expires. Keys: {list(data.keys())}")
-    
+
     return data
 
 
-@app.post("/api/generate-image")
-def generate_imagefx(req: dict):
-    """Generate an image using Google ImageFX API.
-    
-    Body: { "cookie": "<session cookie header string>", "prompt": "...", "aspect_ratio": "LANDSCAPE" }
-    The "cookie" field should be the full cookie header string from labs.google (via Cookie Editor → Export → Header String).
+def _flow_call_single(
+    *,
+    project_id: str,
+    access_token: str,
+    recaptcha_token: str,
+    batch_id: str,
+    session_id: str,
+    model_name: str,
+    aspect_ratio: str,
+    prompt: str,
+    seed: int,
+) -> dict:
+    """Faz uma chamada flowMedia:batchGenerateImages para gerar 1 imagem.
+
+    Retorna {"ok": True, "fife_url": ..., "media_id": ..., "seed": ..., "dimensions": {...}}
+    ou {"ok": False, "error": ..., "auth_expired": bool, "recaptcha_rejected": bool}.
     """
-    cookie = req.get("cookie", "").replace("\r", "").replace("\n", " ").strip()
-    cookie = re.sub(r'\s+', ' ', cookie)
-    prompt = req.get("prompt", "").strip()
-    aspect_ratio = req.get("aspect_ratio", "PORTRAIT").upper()
-    num_images = req.get("num_images", 4)
-    seed = req.get("seed", random.randint(1, 2**31))
-    
+    url = FLOW_API_URL_TEMPLATE.format(project_id=project_id)
+    client_context = {
+        "recaptchaContext": {
+            "token": recaptcha_token,
+            "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+        },
+        "projectId": project_id,
+        "tool": "PINHOLE",
+        "sessionId": session_id,
+    }
+    payload = {
+        "clientContext": client_context,
+        "mediaGenerationContext": {"batchId": batch_id},
+        "useNewMedia": True,
+        "requests": [
+            {
+                "clientContext": client_context,
+                "imageModelName": model_name,
+                "imageAspectRatio": aspect_ratio,
+                "structuredPrompt": {"parts": [{"text": prompt}]},
+                "seed": seed,
+                "imageInputs": [],
+            }
+        ],
+    }
+    headers = {
+        **FLOW_DEFAULT_HEADERS,
+        "Authorization": f"Bearer {access_token}",
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": "timeout (90s)"}
+    except Exception as e:
+        return {"ok": False, "error": f"request failed: {e}"}
+
+    if resp.status_code in (401, 403):
+        body_excerpt = resp.text[:300]
+        recaptcha_rejected = False
+        if resp.status_code == 403:
+            try:
+                data = resp.json()
+                details = data.get("error", {}).get("details", [])
+                reason = (details[0].get("reason", "") if details else "")
+                recaptcha_rejected = "UNUSUAL_ACTIVITY" in reason or "RECAPTCHA" in reason.upper()
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "error": f"HTTP {resp.status_code}: {body_excerpt}",
+            "auth_expired": resp.status_code == 401,
+            "recaptcha_rejected": recaptcha_rejected,
+        }
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+        }
+    try:
+        data = resp.json()
+    except Exception:
+        return {"ok": False, "error": "non-JSON response"}
+
+    for entry in data.get("media", []):
+        gen = entry.get("image", {}).get("generatedImage", {})
+        fife_url = gen.get("fifeUrl")
+        if fife_url:
+            return {
+                "ok": True,
+                "fife_url": fife_url,
+                "media_id": entry.get("name"),
+                "seed": gen.get("seed"),
+                "dimensions": entry.get("image", {}).get("dimensions", {}),
+            }
+    return {"ok": False, "error": "no images in response", "raw_keys": list(data.keys())}
+
+
+def _download_fife_url(fife_url: str) -> bytes | None:
+    """Baixa imagem da URL signada do Flow (flow-content.google)."""
+    try:
+        resp = requests.get(fife_url, timeout=30)
+        if resp.status_code == 200:
+            return resp.content
+        print(f"[Flow] download HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Flow] download failed: {e}")
+    return None
+
+
+@app.post("/api/generate-image")
+def generate_flow(req: dict):
+    """Generate images via Google Flow (NanoBanana 2 / Pro).
+
+    Body:
+      cookie: session cookie header string from labs.google
+      prompt: text prompt
+      aspect_ratio: "16:9" | "4:3" | "1:1" | "3:4" | "9:16" (legacy "PORTRAIT"/"LANDSCAPE" também aceitos)
+      num_images: 1-8 (default 4) — disparados em paralelo
+      model: "nano_banana_2" (default) | "nano_banana_pro"
+      project_id: opcional override (senão lê system_config.flow_project_id)
+    """
+    cookie = (req.get("cookie") or "").replace("\r", "").replace("\n", " ").strip()
+    cookie = re.sub(r"\s+", " ", cookie)
+    prompt = (req.get("prompt") or "").strip()
+    aspect_ratio_raw = (req.get("aspect_ratio") or "16:9").strip()
+    num_images = int(req.get("num_images") or 4)
+    model_raw = (req.get("model") or "nano_banana_2").strip().lower()
+    project_id = (req.get("project_id") or "").strip() or _flow_get_project_id()
+
     if not cookie:
         return JSONResponse(content={"error": "Cookie de sessão é obrigatório"}, status_code=400)
     if not prompt:
         return JSONResponse(content={"error": "Prompt é obrigatório"}, status_code=400)
-    
-    ar_value = ASPECT_RATIO_MAP.get(aspect_ratio, "IMAGE_ASPECT_RATIO_LANDSCAPE")
-    
-    # Step 1: Exchange cookie for access token
+
+    ar_value = ASPECT_RATIO_MAP.get(aspect_ratio_raw) or ASPECT_RATIO_MAP.get(aspect_ratio_raw.upper())
+    if not ar_value:
+        return JSONResponse(content={"error": f"aspect_ratio inválido: {aspect_ratio_raw}"}, status_code=400)
+
+    model_name = MODEL_MAP.get(model_raw)
+    if not model_name:
+        return JSONResponse(
+            content={"error": f"model inválido: {model_raw}. Use nano_banana_2 ou nano_banana_pro"},
+            status_code=400,
+        )
+
+    if num_images < 1 or num_images > 8:
+        return JSONResponse(content={"error": "num_images deve estar entre 1 e 8"}, status_code=400)
+
+    # Step 1: cookie → access_token
     try:
-        session_data = imagefx_get_token(cookie)
+        session_data = flow_get_token(cookie)
         access_token = session_data["access_token"]
-        print(f"[ImageFX] Got access token: {access_token[:20]}...")
+        print(f"[Flow] access_token obtido: {access_token[:20]}...")
     except Exception as e:
         return JSONResponse(
-            content={"error": f"Falha na autenticação: {str(e)}", "auth_expired": True},
-            status_code=401
+            content={"error": f"Falha na autenticação: {e}", "auth_expired": True},
+            status_code=401,
         )
-    
-    # Step 2: Generate image
-    payload = {
-        "userInput": {
-            "candidatesCount": num_images,
-            "prompts": [prompt],
-            "seed": seed
-        },
-        "clientContext": {
-            "sessionId": f";{int(time.time() * 1000)}",
-            "tool": "IMAGE_FX"
-        },
-        "modelInput": {
-            "modelNameType": "IMAGEN_3_5"
-        },
-        "aspectRatio": ar_value
-    }
-    
-    headers = {
-        **IMAGEFX_DEFAULT_HEADERS,
-        "Cookie": cookie,
-        "Authorization": f"Bearer {access_token}",
-    }
-    
-    try:
-        resp = requests.post(IMAGEFX_API_URL, json=payload, headers=headers, timeout=60)
-        
-        if resp.status_code == 401 or resp.status_code == 403:
-            return JSONResponse(
-                content={"error": f"Token expirado ou inválido (HTTP {resp.status_code})", "auth_expired": True},
-                status_code=resp.status_code
-            )
-        
-        if resp.status_code != 200:
-            return JSONResponse(
-                content={"error": f"ImageFX API error: HTTP {resp.status_code}", "detail": resp.text[:500]},
-                status_code=resp.status_code
-            )
-        
-        data = resp.json()
-        
-        # Extract images from response
-        images = []
-        image_panels = data.get("imagePanels", [])
-        for panel in image_panels:
-            generated = panel.get("generatedImages", [])
-            for img in generated:
-                encoded = img.get("encodedImage", "")
-                if encoded:
-                    images.append(encoded)
-        
-        if not images:
-            return JSONResponse(
-                content={"error": "Nenhuma imagem retornada pelo ImageFX", "raw_keys": list(data.keys())},
-                status_code=500
-            )
-        
-        # Save ALL images (Supabase Storage for persistence + local cache)
-        base_id = str(uuid.uuid4())[:12]
-        saved_images = []
-        
-        for idx, encoded in enumerate(images):
-            img_id = f"{base_id}_{idx}"
-            img_bytes = base64.b64decode(encoded)
-            
-            # Local cache
-            img_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{img_id}.png")
+
+    # Step 2: pegar N tokens reCAPTCHA do pool (espera até 30s)
+    recaptcha_tokens = _wait_for_recaptcha_tokens(num_images, timeout=30.0)
+    if len(recaptcha_tokens) < num_images:
+        return JSONResponse(
+            content={
+                "error": (
+                    f"Pool de tokens reCAPTCHA insuficiente: {len(recaptcha_tokens)}/{num_images} "
+                    "disponíveis. Verifique se a flow-token-extension está rodando com a aba do Flow "
+                    "aberta no Chrome."
+                ),
+                "flow_token_missing": True,
+                "available": len(recaptcha_tokens),
+                "needed": num_images,
+            },
+            status_code=503,
+        )
+
+    batch_id = str(uuid.uuid4())
+    session_id = f";{int(time.time() * 1000)}"
+
+    # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
+    def _one(i: int) -> dict:
+        return _flow_call_single(
+            project_id=project_id,
+            access_token=access_token,
+            recaptcha_token=recaptcha_tokens[i],
+            batch_id=batch_id,
+            session_id=session_id,
+            model_name=model_name,
+            aspect_ratio=ar_value,
+            prompt=prompt,
+            seed=random.randint(1, 2 ** 31),
+        )
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(num_images, 4)) as ex:
+        futures = [ex.submit(_one, i) for i in range(num_images)]
+        for fut in futures:
+            try:
+                results.append(fut.result(timeout=120))
+            except Exception as e:
+                results.append({"ok": False, "error": f"exception: {e}"})
+
+    successes = [r for r in results if r.get("ok")]
+    failures = [r for r in results if not r.get("ok")]
+
+    if not successes:
+        any_auth_expired = any(r.get("auth_expired") for r in failures)
+        any_recaptcha = any(r.get("recaptcha_rejected") for r in failures)
+        first_err = failures[0].get("error") if failures else "unknown"
+        return JSONResponse(
+            content={
+                "error": f"Todas as {num_images} gerações falharam. Primeiro erro: {first_err}",
+                "auth_expired": any_auth_expired,
+                "recaptcha_rejected": any_recaptcha,
+                "failures": failures[:4],
+            },
+            status_code=502,
+        )
+
+    # Step 4: download cada fifeUrl + upload Supabase Storage + cache local
+    base_id = str(uuid.uuid4())[:12]
+    saved_images: list[dict] = []
+    for idx, r in enumerate(successes):
+        img_bytes = _download_fife_url(r["fife_url"])
+        if not img_bytes:
+            print(f"[Flow] failed to download image {idx} from {r['fife_url'][:80]}")
+            continue
+        img_id = f"{base_id}_{idx}"
+        try:
+            img_path = os.path.join(FLOW_IMAGES_DIR, f"{img_id}.png")
             with open(img_path, "wb") as f:
                 f.write(img_bytes)
-            
-            # Upload to Supabase Storage (persistent)
-            public_url = upload_to_supabase_storage(img_bytes, f"{img_id}.png")
-            
-            saved_images.append({
+        except Exception as e:
+            print(f"[Flow] local cache failed: {e}")
+        public_url = upload_to_supabase_storage(img_bytes, f"{img_id}.png")
+        saved_images.append(
+            {
                 "image_id": img_id,
-                "image_url": public_url or f"/api/imagefx/{img_id}",
-                "size_bytes": len(img_bytes)
-            })
-        
-        primary = saved_images[0]
-        storage_type = "supabase" if saved_images[0]["image_url"].startswith("http") else "local"
-        print(f"[ImageFX] Generated {len(images)} images, saved as {base_id}_* ({storage_type})")
-        
-        return {
-            "success": True,
-            "image_id": primary["image_id"],
-            "image_url": primary["image_url"],
-            "total_generated": len(saved_images),
-            "size_bytes": primary["size_bytes"],
-            "all_images": [img["image_url"] for img in saved_images]
-        }
-        
-    except requests.exceptions.Timeout:
-        return JSONResponse(content={"error": "ImageFX API timeout (60s)"}, status_code=504)
-    except Exception as e:
-        return JSONResponse(content={"error": f"ImageFX error: {str(e)}"}, status_code=500)
+                "image_url": public_url or f"/api/flow/{img_id}",
+                "size_bytes": len(img_bytes),
+            }
+        )
+
+    if not saved_images:
+        return JSONResponse(
+            content={"error": "Imagens geradas pelo Flow mas todos os downloads falharam"},
+            status_code=502,
+        )
+
+    primary = saved_images[0]
+    storage_type = "supabase" if primary["image_url"].startswith("http") else "local"
+    print(
+        f"[Flow] {len(saved_images)} imagens geradas e salvas como {base_id}_* "
+        f"({storage_type}); falhas: {len(failures)}"
+    )
+
+    return {
+        "success": True,
+        "image_id": primary["image_id"],
+        "image_url": primary["image_url"],
+        "total_generated": len(saved_images),
+        "size_bytes": primary["size_bytes"],
+        "all_images": [s["image_url"] for s in saved_images],
+        "model": model_raw,
+        "aspect_ratio": aspect_ratio_raw,
+        "failures": len(failures),
+    }
 
 
-@app.get("/api/imagefx/{image_id}")
-def get_imagefx_image(image_id: str):
-    """Serve a generated ImageFX image."""
-    image_path = os.path.join(IMAGEFX_IMAGES_DIR, f"{image_id}.png")
+@app.get("/api/flow/{image_id}")
+def get_flow_image(image_id: str):
+    """Serve a generated Flow image (local cache fallback)."""
+    image_path = os.path.join(FLOW_IMAGES_DIR, f"{image_id}.png")
     if os.path.exists(image_path):
         return FileResponse(image_path, media_type="image/png")
     return JSONResponse(content={"error": "Image not found"}, status_code=404)
 
 
+@app.get("/api/imagefx/{image_id}")
+def get_imagefx_image(image_id: str):
+    """Serve a generated image (legacy ImageFX path; tenta flow_output e imagefx_output)."""
+    for d in (FLOW_IMAGES_DIR, IMAGEFX_IMAGES_DIR):
+        p = os.path.join(d, f"{image_id}.png")
+        if os.path.exists(p):
+            return FileResponse(p, media_type="image/png")
+    return JSONResponse(content={"error": "Image not found"}, status_code=404)
+
+
+@app.post("/api/test-flow")
 @app.post("/api/test-imagefx")
-def test_imagefx_token(req: dict):
-    """Test if an ImageFX session cookie is valid.
-    
+def test_flow_token(req: dict):
+    """Test if a Flow session cookie + reCAPTCHA pool + Flow API are working.
+
     Body: { "cookie": "<session cookie header string>" }
     Returns: { "valid": true/false, "message": "...", "user": "..." }
     """
-    cookie = req.get("cookie", "").replace("\r", "").replace("\n", " ").strip()
-    cookie = re.sub(r'\s+', ' ', cookie)
+    cookie = (req.get("cookie") or "").replace("\r", "").replace("\n", " ").strip()
+    cookie = re.sub(r"\s+", " ", cookie)
     if not cookie:
         return JSONResponse(content={"valid": False, "message": "Cookie vazio"}, status_code=400)
-    
-    # Step 1: Try to get an access token from the cookie
+
     try:
-        session_data = imagefx_get_token(cookie)
+        session_data = flow_get_token(cookie)
         access_token = session_data["access_token"]
         user_name = session_data.get("user", {}).get("name", "Unknown")
         user_email = session_data.get("user", {}).get("email", "")
         expires = session_data.get("expires", "")
     except Exception as e:
-        return {"valid": False, "message": f"Autenticação falhou: {str(e)}"}
-    
-    # Step 2: Test a minimal image generation
-    seed = random.randint(1, 2**31)
-    payload = {
-        "userInput": {
-            "candidatesCount": 1,
-            "prompts": ["a simple red circle on white background"],
-            "seed": seed
-        },
-        "clientContext": {
-            "sessionId": f";{int(time.time() * 1000)}",
-            "tool": "IMAGE_FX"
-        },
-        "modelInput": {
-            "modelNameType": "IMAGEN_3_5"
-        },
-        "aspectRatio": "IMAGE_ASPECT_RATIO_SQUARE"
+        return {"valid": False, "message": f"Autenticação falhou: {e}"}
+
+    tokens = _consume_recaptcha_tokens(1)
+    if not tokens:
+        return {
+            "valid": False,
+            "message": (
+                f"Cookie OK (user: {user_name}) mas pool de tokens reCAPTCHA está vazio. "
+                "Abra o Flow no Chrome com a flow-token-extension instalada."
+            ),
+            "user": user_name,
+            "email": user_email,
+            "expires": expires,
+            "flow_token_missing": True,
+        }
+
+    project_id = _flow_get_project_id()
+    result = _flow_call_single(
+        project_id=project_id,
+        access_token=access_token,
+        recaptcha_token=tokens[0],
+        batch_id=str(uuid.uuid4()),
+        session_id=f";{int(time.time() * 1000)}",
+        model_name="NARWHAL",
+        aspect_ratio="IMAGE_ASPECT_RATIO_SQUARE",
+        prompt="a simple red circle on white background",
+        seed=random.randint(1, 2 ** 31),
+    )
+
+    if result.get("ok"):
+        return {
+            "valid": True,
+            "message": f"Cookie + reCAPTCHA + Flow API OK (user: {user_name})",
+            "user": user_name,
+            "email": user_email,
+            "expires": expires,
+            "fife_url": result.get("fife_url"),
+        }
+
+    return {
+        "valid": False,
+        "message": f"Cookie aceito mas Flow API rejeitou: {result.get('error', 'erro desconhecido')}",
+        "user": user_name,
+        "auth_expired": result.get("auth_expired", False),
+        "recaptcha_rejected": result.get("recaptcha_rejected", False),
     }
-    
-    headers = {
-        **IMAGEFX_DEFAULT_HEADERS,
-        "Cookie": cookie,
-        "Authorization": f"Bearer {access_token}",
-    }
-    
-    try:
-        resp = requests.post(IMAGEFX_API_URL, json=payload, headers=headers, timeout=30)
-        
-        if resp.status_code == 401 or resp.status_code == 403:
-            return {"valid": False, "message": f"Token aceito mas API rejeitou (HTTP {resp.status_code})"}
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            has_images = any(
-                img.get("encodedImage")
-                for panel in data.get("imagePanels", [])
-                for img in panel.get("generatedImages", [])
-            )
-            if has_images:
-                return {
-                    "valid": True,
-                    "message": f"Cookie válido — imagem gerada com sucesso (user: {user_name})",
-                    "user": user_name,
-                    "email": user_email,
-                    "expires": expires
-                }
-            else:
-                return {"valid": True, "message": f"Cookie aceito mas sem imagens retornadas (user: {user_name})"}
-        
-        return {"valid": False, "message": f"Erro inesperado: HTTP {resp.status_code}", "detail": resp.text[:300]}
-        
-    except requests.exceptions.Timeout:
-        return {"valid": False, "message": "Timeout ao testar (30s) — mas autenticação OK"}
-    except Exception as e:
-        return {"valid": False, "message": f"Erro: {str(e)}"}
 
 
 ### MCP Server ###
