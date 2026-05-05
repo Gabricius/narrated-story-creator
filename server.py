@@ -2007,7 +2007,7 @@ def resolve_effect_layer(layer: dict, video_dir: str) -> dict | None:
     }
 
 
-def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
+def upload_to_supabase_storage(image_bytes: bytes, filename: str, content_type: str = "image/png") -> str | None:
     """Upload image to Supabase Storage bucket. Returns public URL or None on failure."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print("[ImageFX] Supabase Storage not configured, skipping upload")
@@ -2017,11 +2017,11 @@ def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
             f"{SUPABASE_URL}/storage/v1/object/{IMAGEFX_BUCKET}/{filename}",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": "image/png",
-                "x-upsert": "true"
+                "Content-Type": content_type,
+                "x-upsert": "true",
             },
             data=image_bytes,
-            timeout=30
+            timeout=30,
         )
         if resp.status_code in (200, 201):
             public_url = f"{SUPABASE_URL}/storage/v1/object/public/{IMAGEFX_BUCKET}/{filename}"
@@ -2032,6 +2032,24 @@ def upload_to_supabase_storage(image_bytes: bytes, filename: str) -> str | None:
     except Exception as e:
         print(f"[ImageFX] Supabase upload error: {e}")
         return None
+
+
+def _detect_image_type(image_bytes: bytes) -> tuple[str, str] | None:
+    """Detect image type from magic bytes.
+
+    Returns (content_type, extension) or None if not a valid image.
+    """
+    if not image_bytes or len(image_bytes) < 12:
+        return None
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return ("image/png", "png")
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return ("image/jpeg", "jpg")
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return ("image/webp", "webp")
+    if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return ("image/gif", "gif")
+    return None
 
 FLOW_DEFAULT_HEADERS = {
     "Content-Type": "text/plain;charset=UTF-8",  # importante: evita CORS preflight (body é JSON)
@@ -2280,16 +2298,52 @@ def _flow_call_single(
     return {"ok": False, "error": "no images in response", "raw_keys": list(data.keys())}
 
 
-def _download_fife_url(fife_url: str) -> bytes | None:
-    """Baixa imagem da URL signada do Flow (flow-content.google)."""
+def _download_fife_url(fife_url: str) -> tuple[bytes, str, str] | None:
+    """Baixa imagem da URL signada do Flow (flow-content.google).
+
+    Retorna (bytes, content_type, extension) ou None se falhar.
+    Valida via magic bytes — rejeita HTML/JSON retornados com status 200.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://labs.google/",
+        "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+    }
     try:
-        resp = requests.get(fife_url, timeout=30)
-        if resp.status_code == 200:
-            return resp.content
-        print(f"[Flow] download HTTP {resp.status_code}: {resp.text[:200]}")
+        resp = requests.get(fife_url, headers=headers, timeout=60)
     except Exception as e:
-        print(f"[Flow] download failed: {e}")
-    return None
+        print(f"[Flow] download exception: {e}")
+        return None
+
+    if resp.status_code != 200:
+        print(f"[Flow] download HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    body = resp.content
+    server_ct = resp.headers.get("Content-Type", "")
+    if not body:
+        print("[Flow] download returned empty body")
+        return None
+
+    detected = _detect_image_type(body)
+    if not detected:
+        # Não é imagem válida — provavelmente HTML/JSON de erro com status 200
+        preview = body[:200].decode("utf-8", errors="replace")
+        print(
+            f"[Flow] download não é imagem válida — Content-Type={server_ct}, "
+            f"size={len(body)}, preview={preview!r}"
+        )
+        return None
+
+    content_type, ext = detected
+    print(
+        f"[Flow] download ok — server_ct={server_ct}, detected={content_type}, "
+        f"size={len(body)} bytes"
+    )
+    return (body, content_type, ext)
 
 
 @app.post("/api/generate-image")
@@ -2406,23 +2460,26 @@ def generate_flow(req: dict):
     base_id = str(uuid.uuid4())[:12]
     saved_images: list[dict] = []
     for idx, r in enumerate(successes):
-        img_bytes = _download_fife_url(r["fife_url"])
-        if not img_bytes:
+        downloaded = _download_fife_url(r["fife_url"])
+        if not downloaded:
             print(f"[Flow] failed to download image {idx} from {r['fife_url'][:80]}")
             continue
+        img_bytes, content_type, ext = downloaded
         img_id = f"{base_id}_{idx}"
+        filename = f"{img_id}.{ext}"
         try:
-            img_path = os.path.join(FLOW_IMAGES_DIR, f"{img_id}.png")
+            img_path = os.path.join(FLOW_IMAGES_DIR, filename)
             with open(img_path, "wb") as f:
                 f.write(img_bytes)
         except Exception as e:
             print(f"[Flow] local cache failed: {e}")
-        public_url = upload_to_supabase_storage(img_bytes, f"{img_id}.png")
+        public_url = upload_to_supabase_storage(img_bytes, filename, content_type=content_type)
         saved_images.append(
             {
                 "image_id": img_id,
-                "image_url": public_url or f"/api/flow/{img_id}",
+                "image_url": public_url or f"/api/flow/{filename}",
                 "size_bytes": len(img_bytes),
+                "content_type": content_type,
             }
         )
 
@@ -2452,23 +2509,43 @@ def generate_flow(req: dict):
     }
 
 
+_IMG_EXT_MEDIA_TYPE = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "gif": "image/gif",
+}
+
+
+def _serve_image_from_dirs(name: str, dirs: tuple[str, ...]):
+    """Procura `name` (com ou sem extensão) em `dirs`. Retorna FileResponse com media_type correto."""
+    # Caso o caller passe já com extensão
+    if "." in os.path.basename(name):
+        for d in dirs:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                ext = name.rsplit(".", 1)[-1].lower()
+                return FileResponse(p, media_type=_IMG_EXT_MEDIA_TYPE.get(ext, "application/octet-stream"))
+    # Caso só image_id sem ext — testa cada extensão conhecida
+    for d in dirs:
+        for ext, media in _IMG_EXT_MEDIA_TYPE.items():
+            p = os.path.join(d, f"{name}.{ext}")
+            if os.path.exists(p):
+                return FileResponse(p, media_type=media)
+    return JSONResponse(content={"error": "Image not found"}, status_code=404)
+
+
 @app.get("/api/flow/{image_id}")
 def get_flow_image(image_id: str):
     """Serve a generated Flow image (local cache fallback)."""
-    image_path = os.path.join(FLOW_IMAGES_DIR, f"{image_id}.png")
-    if os.path.exists(image_path):
-        return FileResponse(image_path, media_type="image/png")
-    return JSONResponse(content={"error": "Image not found"}, status_code=404)
+    return _serve_image_from_dirs(image_id, (FLOW_IMAGES_DIR,))
 
 
 @app.get("/api/imagefx/{image_id}")
 def get_imagefx_image(image_id: str):
     """Serve a generated image (legacy ImageFX path; tenta flow_output e imagefx_output)."""
-    for d in (FLOW_IMAGES_DIR, IMAGEFX_IMAGES_DIR):
-        p = os.path.join(d, f"{image_id}.png")
-        if os.path.exists(p):
-            return FileResponse(p, media_type="image/png")
-    return JSONResponse(content={"error": "Image not found"}, status_code=404)
+    return _serve_image_from_dirs(image_id, (FLOW_IMAGES_DIR, IMAGEFX_IMAGES_DIR))
 
 
 @app.post("/api/test-flow")
