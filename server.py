@@ -2159,6 +2159,50 @@ def flow_token_set(req: dict):
     return {"success": True, "pool_size": pool_size}
 
 
+@app.post("/api/flow-cookie-set")
+def flow_cookie_set(req: dict):
+    """Endpoint chamado pela flow-token-extension a cada ciclo de sincronização de
+    cookies (a cada ~5 min, ou só quando o cookie muda — a extensão envia um hash
+    diff para evitar spam).
+
+    Atualiza system_config.flow_cookie via Supabase REST e invalida o cache local
+    para que a próxima chamada de /api/generate-image use o cookie novo.
+
+    Body:
+      cookie: string Cookie: header completa (e.g., "SID=...; HSID=...; ...")
+    """
+    cookie = (req.get("cookie") or "").strip()
+    if not cookie:
+        return JSONResponse(content={"error": "empty cookie"}, status_code=400)
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return JSONResponse(content={"error": "supabase not configured on backend"}, status_code=500)
+    try:
+        resp = requests.post(
+            f"{SUPABASE_URL}/rest/v1/system_config?on_conflict=key",
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+            json={"key": "flow_cookie", "value": cookie},
+            timeout=10,
+        )
+        # Bust the in-memory cache so the next generate-image picks up the new value.
+        try:
+            _SYSTEM_CONFIG_CACHE.pop("flow_cookie", None)
+        except NameError:
+            pass
+        if not resp.ok:
+            return JSONResponse(
+                content={"error": f"supabase {resp.status_code}: {resp.text[:200]}"},
+                status_code=500,
+            )
+        return {"success": True, "cookie_length": len(cookie)}
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
 @app.get("/api/flow-token-status")
 def flow_token_status():
     """UI consulta para mostrar estado do pool."""
