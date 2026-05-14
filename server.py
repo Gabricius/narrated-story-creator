@@ -2446,14 +2446,18 @@ def generate_flow(req: dict):
         any_auth_expired = any(r.get("auth_expired") for r in failures)
         any_recaptcha = any(r.get("recaptcha_rejected") for r in failures)
         first_err = failures[0].get("error") if failures else "unknown"
+        # 2026-05-14 — return 200 with success=false so reverse proxies (Easypanel/Traefik)
+        # do NOT replace the JSON body with their generic "Not Found" HTML error page.
+        # Callers (N8N JOB 3) must check the `success` field on the body, not just status_code.
         return JSONResponse(
             content={
+                "success": False,
                 "error": f"Todas as {num_images} gerações falharam. Primeiro erro: {first_err}",
                 "auth_expired": any_auth_expired,
                 "recaptcha_rejected": any_recaptcha,
                 "failures": failures[:4],
             },
-            status_code=502,
+            status_code=200,
         )
 
     # Step 4: download cada fifeUrl + upload Supabase Storage + cache local
@@ -2484,9 +2488,13 @@ def generate_flow(req: dict):
         )
 
     if not saved_images:
+        # 2026-05-14 — return 200 with success=false (see note on the other failure return above).
         return JSONResponse(
-            content={"error": "Imagens geradas pelo Flow mas todos os downloads falharam"},
-            status_code=502,
+            content={
+                "success": False,
+                "error": "Imagens geradas pelo Flow mas todos os downloads falharam",
+            },
+            status_code=200,
         )
 
     primary = saved_images[0]
