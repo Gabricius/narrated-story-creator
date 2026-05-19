@@ -20,6 +20,13 @@ COPY --from=rclone/rclone:latest /usr/local/bin/rclone /usr/bin/rclone
 # Instalar dependências Python
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Instalar Chromium + bibliotecas de sistema necessárias para o Playwright
+# (usado pelo endpoint /api/thumb-make — renderização HTML→PNG manual no
+# Thumb Maker do pipeline-manager). --with-deps instala as libs nativas no
+# debian-slim. ~250-300MB a mais no container; aceitável pra eliminar a
+# dependência no serviço thumb-renderer separado.
+RUN playwright install --with-deps chromium
+
 # Criar diretórios necessários
 RUN mkdir -p /app/assets /app/tmp /app/videos
 
