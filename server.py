@@ -902,9 +902,11 @@ def load_videos():
 
 def save_videos():
     try:
+        with worker_lock:
+            videos_copy = dict(videos)
         with shelve.open(SHELVE_FILE_PATH) as db:
-            db['videos'] = videos
-            print(f"Saved {len(videos)} videos to persistent storage")
+            db['videos'] = videos_copy
+            print(f"Saved {len(videos_copy)} videos to persistent storage")
     except Exception as e:
         print(f"Error saving videos to persistent storage: {e}")
 
@@ -1159,7 +1161,7 @@ def process_video_queue():
                                 print(f"[V4] Warning: effect layer "
                                       f"'{layer.get('label', layer.get('id', '?'))}' could not be resolved")
 
-                        render_video_v4(
+                        success = render_video_v4(
                             bg_paths=bg_paths,
                             overlay_path=overlay_path,
                             sound_path=sound_path,
@@ -1169,6 +1171,8 @@ def process_video_queue():
                             effect_layers_resolved=effect_layers_resolved if effect_layers_resolved else None,
                             progress_callback=_render_progress,
                         )
+                        if not success:
+                            raise RuntimeError("[RENDER-V4] render_video_v4 returned False")
 
                         # Clean up resolved effect temp files
                         for resolved in effect_layers_resolved:
@@ -1192,7 +1196,7 @@ def process_video_queue():
                                 drive_filename=sub_overlay_file,
                             )
 
-                        render_video(
+                        success = render_video(
                             sound_path=sound_path, subtitle_path=subtitle_path,
                             overlay_path=overlay_path, audio_length=audio_length,
                             bg_video_path=bg_video_path, output_path=video_path,
@@ -1201,6 +1205,8 @@ def process_video_queue():
                             subscribe_interval=data.get("subscribe_interval", 180),
                             progress_callback=_render_progress,
                         )
+                        if not success:
+                            raise RuntimeError("[RENDER-V2] render_video returned False")
                     
                     try:
                         print(f"Cleaning up temporary files for video: {video_id}")
@@ -1277,7 +1283,9 @@ def get_languages():
 
 @app.get("/api/videos")
 def list_videos():
-    return [{"video_id": vid, "status": vd["status"]} for vid, vd in videos.items()]
+    with worker_lock:
+        videos_copy = dict(videos)
+    return [{"video_id": vid, "status": vd["status"]} for vid, vd in videos_copy.items()]
 
 @app.post("/api/videos")
 def create_video(video: dict):
@@ -1362,9 +1370,11 @@ def get_video(video_id: str):
 
 @app.get("/api/videos/{video_id}")
 def download_video(video_id: str, download: bool = False):
-    if video_id in videos and videos[video_id]["status"] == VideoStatus.COMPLETED:
+    with worker_lock:
+        vid_entry = videos.get(video_id)
+    if vid_entry is not None and vid_entry["status"] == VideoStatus.COMPLETED:
         # If on Google Drive, redirect
-        drive_url = videos[video_id].get("drive_url")
+        drive_url = vid_entry.get("drive_url")
         if drive_url:
             from fastapi.responses import RedirectResponse
             return RedirectResponse(url=drive_url)
@@ -1376,10 +1386,10 @@ def download_video(video_id: str, download: bool = False):
                 headers={"Content-Disposition": f'attachment; filename="{video_id}.mp4"'}
             )
         return JSONResponse(content={"video_id": video_id, "status": "file_cleaned"}, status_code=status.HTTP_410_GONE)
-    elif video_id in videos:
-        if videos[video_id]["status"] == VideoStatus.FAILED:
+    elif vid_entry is not None:
+        if vid_entry["status"] == VideoStatus.FAILED:
             return JSONResponse(content={"video_id": video_id, "status": VideoStatus.FAILED}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        if videos[video_id]["status"] == VideoStatus.PROCESSING:
+        if vid_entry["status"] == VideoStatus.PROCESSING:
             return JSONResponse(content={"video_id": video_id, "status": VideoStatus.PROCESSING}, status_code=status.HTTP_202_ACCEPTED)
     return JSONResponse(content={"video_id": video_id, "status": VideoStatus.NOT_FOUND}, status_code=status.HTTP_404_NOT_FOUND)
 
@@ -1402,10 +1412,12 @@ def delete_video(video_id: str):
 @app.get("/api/disk")
 def disk_status():
     """Show disk usage for video storage."""
+    with worker_lock:
+        videos_copy = dict(videos)
     entries = []
     total_size = 0
     drive_count = 0
-    for vid, data in videos.items():
+    for vid, data in videos_copy.items():
         path = os.path.join(VIDEOS_DIR, f"{vid}.mp4")
         exists = os.path.exists(path)
         size = os.path.getsize(path) if exists else 0
@@ -1433,14 +1445,17 @@ def upload_local_to_drive(video_id: str = None):
     results = []
     targets = []
 
+    with worker_lock:
+        videos_copy = dict(videos)
+
     if video_id:
-        if video_id in videos:
+        if video_id in videos_copy:
             targets.append(video_id)
         else:
             return JSONResponse(content={"error": "Video not found"}, status_code=404)
     else:
         # All local completed videos without drive_url
-        targets = [vid for vid, data in videos.items()
+        targets = [vid for vid, data in videos_copy.items()
                    if data["status"] == VideoStatus.COMPLETED and not data.get("drive_url")]
 
     for vid in targets:
@@ -1450,13 +1465,17 @@ def upload_local_to_drive(video_id: str = None):
             continue
 
         size_mb = os.path.getsize(video_path) / 1024 / 1024
-        folder_id = videos[vid].get("data", {}).get("gdrive_folder_id") or RCLONE_FOLDER_ID
+        with worker_lock:
+            vid_entry = videos.get(vid)
+            folder_id = vid_entry.get("data", {}).get("gdrive_folder_id") or RCLONE_FOLDER_ID if vid_entry else None
         if not folder_id:
             results.append({"video_id": vid, "status": "no_folder_id"})
             continue
         drive_url = rclone_upload_video(video_path, f"{vid}.mp4", folder_id=folder_id)
         if drive_url:
-            videos[vid]["drive_url"] = drive_url
+            with worker_lock:
+                if vid in videos:
+                    videos[vid]["drive_url"] = drive_url
             save_videos()
             try:
                 os.remove(video_path)
@@ -1510,10 +1529,12 @@ async def tts_preview(request: Request):
 
 @app.get("/api/queue")
 def get_queue_status():
+    with worker_lock:
+        videos_copy = dict(videos)
     return {
         "queue_size": video_queue.qsize(),
-        "queued": len([v for v in videos.values() if v["status"] == VideoStatus.QUEUED]),
-        "processing": len([v for v in videos.values() if v["status"] == VideoStatus.PROCESSING])
+        "queued": len([v for v in videos_copy.values() if v["status"] == VideoStatus.QUEUED]),
+        "processing": len([v for v in videos_copy.values() if v["status"] == VideoStatus.PROCESSING])
     }
 
 @app.get("/api/diagnostics")
@@ -1597,7 +1618,9 @@ def run_diagnostics():
     
     # 5. Videos summary
     statuses = {}
-    for v in videos.values():
+    with worker_lock:
+        videos_copy = dict(videos)
+    for v in videos_copy.values():
         s = v["status"]
         statuses[s] = statuses.get(s, 0) + 1
     results["videos"] = statuses
@@ -1663,7 +1686,9 @@ def create_test_video(params: dict = {}):
     # Use a default test person image if none provided
     if not person_image_url:
         # Try to find any character image from existing channels
-        for vid_data in videos.values():
+        with worker_lock:
+            videos_copy = dict(videos)
+        for vid_data in videos_copy.values():
             d = vid_data.get("data", {})
             if d.get("person_image_url"):
                 person_image_url = d["person_image_url"]
@@ -1699,7 +1724,8 @@ def create_test_video(params: dict = {}):
     if error:
         return JSONResponse(content={"error": error}, status_code=400)
 
-    videos[video_id] = video_data
+    with worker_lock:
+        videos[video_id] = video_data
     save_videos()
     video_queue.put(video_id)
     return {
@@ -2697,7 +2723,8 @@ def create_video_mcp(
     )
     if error:
         return {"error": error}
-    videos[video_id] = video_data
+    with worker_lock:
+        videos[video_id] = video_data
     save_videos()
     video_queue.put(video_id)
     return {"video_id": video_id, "status": VideoStatus.QUEUED.value}
