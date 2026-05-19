@@ -2702,6 +2702,409 @@ def create_video_mcp(
     video_queue.put(video_id)
     return {"video_id": video_id, "status": VideoStatus.QUEUED.value}
 
+
+# ─────────────────────────────────────────────────────────────────────
+# THUMB MAKER — standalone manual thumbnail composer
+# Used by the Pipeline Manager "Thumb Maker" view. Composes a 1280x720
+# PNG entirely in PIL — no Puppeteer, no external service. Each template
+# corresponds to one of the channels' visual identities per the golden
+# rules in .claude/rules/golden_rules_*.md.
+# ─────────────────────────────────────────────────────────────────────
+
+THUMB_TEMPLATES_CONFIG = {
+    "multi_color_calmdrama": {
+        "label": "Gracious V2 (multi_color_calmdrama)",
+        "bg_color": "#050505",
+        "text_color": "#FFFFFF",
+        "text_split_pct": 0.52,
+        "tagline_mode": "embedded",
+        "tagline_bar_color": None,
+        "tagline_text_color": "#FFFFFF",
+        "has_palette": True,
+        "default_palette": "var_classic",
+        "span_colors": None,  # comes from palette
+    },
+    "apple_revenge_v2": {
+        "label": "Apple Revenge V2 (red bar)",
+        "bg_color": "#050505",
+        "text_color": "#FFFFFF",
+        "text_split_pct": 0.56,
+        "tagline_mode": "bar",
+        "tagline_bar_color": "#C4151C",
+        "tagline_text_color": "#FFFFFF",
+        "has_palette": False,
+        "span_colors": {"s1": "#E63946", "s2": "#3FA34D", "s3": "#FFFFFF", "s4": "#FFFFFF"},
+    },
+    "karmas_script": {
+        "label": "Karma's Script (gold bar)",
+        "bg_color": "#F2EDE4",
+        "text_color": "#C2185B",
+        "text_split_pct": 0.62,
+        "tagline_mode": "bar",
+        "tagline_bar_color": "#B8860B",
+        "tagline_text_color": "#FFFFFF",
+        "has_palette": False,
+        "span_colors": {"s1": "#FF1493", "s2": "#B8860B", "s3": "#0099B5", "s4": "#FFFFFF"},
+    },
+    "still_standing": {
+        "label": "Still Standing (orange bar)",
+        "bg_color": "#000000",
+        "text_color": "#FFFFFF",
+        "text_split_pct": 0.62,
+        "tagline_mode": "bar",
+        "tagline_bar_color": "#C75B00",
+        "tagline_text_color": "#FFFFFF",
+        "has_palette": False,
+        "span_colors": {"s1": "#FFD700", "s2": "#00E5FF", "s3": "#FF6B35", "s4": "#FFFFFF"},
+    },
+    "tales_of_vengence": {
+        "label": "Tales of Vengence (crimson bar)",
+        "bg_color": "#000000",
+        "text_color": "#FFFFFF",
+        "text_split_pct": 0.62,
+        "tagline_mode": "bar",
+        "tagline_bar_color": "#7B0D0D",
+        "tagline_text_color": "#FFFFFF",
+        "has_palette": False,
+        "span_colors": {"s1": "#C0392B", "s2": "#F39C12", "s3": "#8E44AD", "s4": "#FFFFFF"},
+    },
+}
+
+THUMB_PALETTES = {
+    "var_classic":     {"s1": "#FFD700", "s2": "#FF1493", "s3": "#00D4FF", "s4": "#FF4444"},
+    "var_emerald":     {"s1": "#FFD700", "s2": "#00FF88", "s3": "#FF6B35", "s4": "#FF4444"},
+    "var_pink_pop":    {"s1": "#FF1493", "s2": "#FFD700", "s3": "#00D4FF", "s4": "#FF4444"},
+    "var_court":       {"s1": "#FFD700", "s2": "#FF4444", "s3": "#00D4FF", "s4": "#FFFFFF"},
+    "var_inheritance": {"s1": "#8E44AD", "s2": "#FFD700", "s3": "#00D4FF", "s4": "#FF4444"},
+    "var_warm_glow":   {"s1": "#FFB000", "s2": "#FF6B35", "s3": "#00D4FF", "s4": "#FF4444"},
+}
+
+THUMB_FONT_PATH = os.path.join(WORK_DIR, "assets", "anton.ttf")
+THUMB_FONT_FALLBACK = os.path.join(WORK_DIR, "assets", "arial.ttf")
+THUMB_CANVAS_W = 1280
+THUMB_CANVAS_H = 720
+THUMB_TAGLINE_BAR_H = 100
+THUMB_BODY_FONT_SIZE = 38
+THUMB_TAGLINE_FONT_SIZE = 60
+THUMB_PAD = 44
+
+
+def _thumb_load_font(size: int):
+    """Load Anton (preferred) with Arial fallback. Both are downloaded by Dockerfile."""
+    from PIL import ImageFont
+    for p in (THUMB_FONT_PATH, THUMB_FONT_FALLBACK):
+        try:
+            return ImageFont.truetype(p, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _thumb_parse_formatted_context(text: str):
+    """Split formatted_context into (body_segments, tagline_text).
+
+    - body_segments: list of {"text": str, "span": str|None}
+      where span is "s1"/"s2"/"s3" or None for neutral text.
+    - tagline_text: contents of the trailing <s4>...</s4> if present, else "".
+    """
+    text = (text or "").strip()
+    tagline = ""
+    m = re.search(r"<s4>([\s\S]*?)</s4>\s*$", text, flags=re.IGNORECASE)
+    if m:
+        tagline = m.group(1).strip()
+        body_text = text[: m.start()].rstrip()
+    else:
+        body_text = text
+
+    span_re = re.compile(r"<(s[1-4])>([\s\S]*?)</\1>", flags=re.IGNORECASE)
+    segments = []
+    pos = 0
+    for sm in span_re.finditer(body_text):
+        if sm.start() > pos:
+            neutral = body_text[pos:sm.start()]
+            if neutral:
+                segments.append({"text": neutral, "span": None})
+        segments.append({"text": sm.group(2), "span": sm.group(1).lower()})
+        pos = sm.end()
+    if pos < len(body_text):
+        tail = body_text[pos:]
+        if tail:
+            segments.append({"text": tail, "span": None})
+    return segments, tagline
+
+
+def _thumb_text_width(font, text: str) -> int:
+    """PIL ≥ 9 uses font.getlength; older uses getsize."""
+    try:
+        return int(font.getlength(text))
+    except AttributeError:
+        return int(font.getsize(text)[0])
+
+
+def _thumb_wrap_tokens(segments, font, max_width):
+    """Tokenize segments into words preserving span tag, then greedy-wrap into lines.
+
+    Returns list of lines; each line is a list of tokens {"text", "span"}.
+    Whitespace is preserved between tokens within a line; consumed at line breaks.
+    """
+    tokens = []
+    for seg in segments:
+        parts = re.split(r"(\s+)", seg["text"])
+        for p in parts:
+            if p == "":
+                continue
+            tokens.append({"text": p, "span": seg["span"]})
+
+    lines = []
+    cur = []
+    cur_w = 0
+    for tok in tokens:
+        is_ws = tok["text"].isspace()
+        # Trim leading whitespace at start of a line
+        if is_ws and not cur:
+            continue
+        w = _thumb_text_width(font, tok["text"])
+        if cur_w + w > max_width and cur:
+            # Strip trailing whitespace from current line, then push
+            while cur and cur[-1]["text"].isspace():
+                cur.pop()
+            lines.append(cur)
+            cur = []
+            cur_w = 0
+            if is_ws:
+                continue
+        cur.append(tok)
+        cur_w += w
+    if cur:
+        while cur and cur[-1]["text"].isspace():
+            cur.pop()
+        if cur:
+            lines.append(cur)
+    return lines
+
+
+def _thumb_draw_text_with_outline(draw, x, y, text, font, fill, outline="#000000", thickness=2):
+    """Draw text with a hard black outline for legibility on busy backgrounds."""
+    for dx in range(-thickness, thickness + 1):
+        for dy in range(-thickness, thickness + 1):
+            if dx == 0 and dy == 0:
+                continue
+            draw.text((x + dx, y + dy), text, font=font, fill=outline)
+    draw.text((x, y), text, font=font, fill=fill)
+
+
+def _thumb_render_image_panel(image_bytes: bytes, panel_w: int, panel_h: int):
+    """Resize+center-crop the input image to fill the panel exactly."""
+    from PIL import Image
+    import io
+    src = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    sw, sh = src.size
+    scale = max(panel_w / sw, panel_h / sh)
+    new_w = int(sw * scale)
+    new_h = int(sh * scale)
+    resized = src.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - panel_w) // 2
+    top = (new_h - panel_h) // 2
+    return resized.crop((left, top, left + panel_w, top + panel_h))
+
+
+def _thumb_compose(template_id: str, formatted_context: str,
+                   image_bytes: bytes, palette_id: str | None = None) -> bytes:
+    """Compose a 1280x720 thumbnail per template and return PNG bytes."""
+    from PIL import Image, ImageDraw
+    import io
+
+    cfg = THUMB_TEMPLATES_CONFIG.get(template_id)
+    if not cfg:
+        raise ValueError(f"unknown template_id: {template_id}")
+
+    # Resolve span colors
+    if cfg["has_palette"]:
+        pal = THUMB_PALETTES.get(palette_id or cfg.get("default_palette") or "var_classic",
+                                 THUMB_PALETTES["var_classic"])
+        span_colors = {"s1": pal["s1"], "s2": pal["s2"], "s3": pal["s3"], "s4": pal["s4"]}
+    else:
+        span_colors = dict(cfg["span_colors"])
+
+    # Layout calc
+    use_bar = cfg["tagline_mode"] == "bar"
+    bar_h = THUMB_TAGLINE_BAR_H if use_bar else 0
+    panel_h = THUMB_CANVAS_H - bar_h
+    text_w = int(THUMB_CANVAS_W * cfg["text_split_pct"])
+    image_w = THUMB_CANVAS_W - text_w
+
+    canvas = Image.new("RGB", (THUMB_CANVAS_W, THUMB_CANVAS_H), cfg["bg_color"])
+
+    # Right-side image panel
+    if image_bytes:
+        try:
+            img_panel = _thumb_render_image_panel(image_bytes, image_w, panel_h)
+            canvas.paste(img_panel, (text_w, 0))
+        except Exception as e:
+            print(f"[thumb-make] image render failed: {e}")
+            # Leave the panel as background color
+
+    draw = ImageDraw.Draw(canvas)
+
+    # Left-side text block
+    body_font = _thumb_load_font(THUMB_BODY_FONT_SIZE)
+    tagline_font = _thumb_load_font(THUMB_TAGLINE_FONT_SIZE)
+
+    body_segments, tagline_text = _thumb_parse_formatted_context(formatted_context)
+    # All body and tagline text is uppercase per channel rules
+    for s in body_segments:
+        s["text"] = s["text"].upper()
+    tagline_text_upper = tagline_text.upper()
+
+    max_text_width = text_w - 2 * THUMB_PAD
+    lines = _thumb_wrap_tokens(body_segments, body_font, max_text_width)
+
+    line_height = int(THUMB_BODY_FONT_SIZE * 1.18)
+    tagline_line_height = int(THUMB_TAGLINE_FONT_SIZE * 1.02)
+
+    # If tagline is embedded (multi_color_calmdrama), wrap it too and account for height
+    embedded_tagline_lines = []
+    if not use_bar and tagline_text_upper:
+        tagline_segs = [{"text": tagline_text_upper, "span": "s4"}]
+        embedded_tagline_lines = _thumb_wrap_tokens(tagline_segs, tagline_font, max_text_width)
+
+    body_block_h = line_height * len(lines)
+    embedded_h = tagline_line_height * len(embedded_tagline_lines)
+    gap_before_tagline = 24 if embedded_tagline_lines else 0
+    total_text_h = body_block_h + gap_before_tagline + embedded_h
+
+    # Vertically center within the left panel (excluding tagline bar)
+    available_h = panel_h
+    y = max(THUMB_PAD, (available_h - total_text_h) // 2)
+
+    # Whether to outline (busy bg = dark templates yes; light bg karmas_script = no)
+    bg_is_dark = cfg["bg_color"].lower() not in ("#f2ede4", "#ffffff")
+
+    def draw_line(line_tokens, x_start, y_pos, font, default_fill):
+        x = x_start
+        for tok in line_tokens:
+            color = span_colors.get(tok["span"], default_fill) if tok["span"] else default_fill
+            if bg_is_dark:
+                _thumb_draw_text_with_outline(draw, x, y_pos, tok["text"], font, color, "#000000", 2)
+            else:
+                draw.text((x, y_pos), tok["text"], font=font, fill=color)
+            x += _thumb_text_width(font, tok["text"])
+
+    # Body lines
+    for line in lines:
+        draw_line(line, THUMB_PAD, y, body_font, cfg["text_color"])
+        y += line_height
+
+    # Embedded tagline (only multi_color_calmdrama)
+    if embedded_tagline_lines:
+        y += gap_before_tagline
+        for line in embedded_tagline_lines:
+            draw_line(line, THUMB_PAD, y, tagline_font, span_colors.get("s4", "#FFFFFF"))
+            y += tagline_line_height
+
+    # Bottom tagline bar (the other 4 templates)
+    if use_bar:
+        bar_y0 = THUMB_CANVAS_H - bar_h
+        draw.rectangle([0, bar_y0, THUMB_CANVAS_W, THUMB_CANVAS_H],
+                       fill=cfg["tagline_bar_color"])
+        if tagline_text_upper:
+            # Single-line centered tagline; scale font down if it overflows
+            font_size = THUMB_TAGLINE_FONT_SIZE - 6
+            while font_size >= 28:
+                tf = _thumb_load_font(font_size)
+                tw = _thumb_text_width(tf, tagline_text_upper)
+                if tw <= THUMB_CANVAS_W - 80:
+                    break
+                font_size -= 4
+            tf = _thumb_load_font(font_size)
+            tw = _thumb_text_width(tf, tagline_text_upper)
+            try:
+                ascent, descent = tf.getmetrics()
+                th = ascent + descent
+            except Exception:
+                th = font_size
+            tx = (THUMB_CANVAS_W - tw) // 2
+            ty = bar_y0 + (bar_h - th) // 2
+            draw.text((tx, ty), tagline_text_upper, font=tf, fill=cfg["tagline_text_color"])
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+@app.post("/api/thumb-make")
+def thumb_make(req: dict):
+    """Compose a 1280x720 thumbnail manually and stream the PNG back.
+
+    Body:
+      template_id: one of THUMB_TEMPLATES_CONFIG keys
+      formatted_context: HTML-ish string with <s1>..<s4>...</sX> spans;
+        the trailing <s4>...</s4> is treated as the tagline.
+      image_base64: data URL ("data:image/png;base64,...") or raw base64 string
+      palette_id: optional, only relevant for templates with has_palette=True
+                  (multi_color_calmdrama). One of THUMB_PALETTES keys.
+
+    Returns: image/png stream (Content-Type: image/png), or JSON error.
+    """
+    template_id = (req.get("template_id") or "").strip()
+    formatted_context = req.get("formatted_context") or ""
+    image_b64 = req.get("image_base64") or ""
+    palette_id = req.get("palette_id") or None
+
+    if template_id not in THUMB_TEMPLATES_CONFIG:
+        return JSONResponse(
+            content={"error": f"template_id inválido. Use: {list(THUMB_TEMPLATES_CONFIG.keys())}"},
+            status_code=400,
+        )
+    if not formatted_context.strip():
+        return JSONResponse(content={"error": "formatted_context é obrigatório"}, status_code=400)
+    if not image_b64:
+        return JSONResponse(content={"error": "image_base64 é obrigatório"}, status_code=400)
+
+    # Strip data-URL prefix if present
+    if image_b64.startswith("data:"):
+        comma = image_b64.find(",")
+        if comma >= 0:
+            image_b64 = image_b64[comma + 1:]
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        return JSONResponse(content={"error": f"image_base64 inválido: {e}"}, status_code=400)
+
+    try:
+        png_bytes = _thumb_compose(template_id, formatted_context, image_bytes, palette_id)
+    except Exception as e:
+        return JSONResponse(content={"error": f"render falhou: {e}"}, status_code=500)
+
+    import io as _io
+    return StreamingResponse(
+        _io.BytesIO(png_bytes),
+        media_type="image/png",
+        headers={"Content-Disposition": 'attachment; filename="thumb.png"'},
+    )
+
+
+@app.get("/api/thumb-make/templates")
+def thumb_make_templates():
+    """List available templates and palettes for the Thumb Maker UI."""
+    return {
+        "templates": [
+            {
+                "id": tid,
+                "label": cfg["label"],
+                "has_palette": cfg["has_palette"],
+                "default_palette": cfg.get("default_palette"),
+                "tagline_mode": cfg["tagline_mode"],
+            }
+            for tid, cfg in THUMB_TEMPLATES_CONFIG.items()
+        ],
+        "palettes": [
+            {"id": pid, "colors": pal} for pid, pal in THUMB_PALETTES.items()
+        ],
+    }
+
+
 sse = SseServerTransport("/mcp/messages/")
 app.router.routes.append(Mount("/mcp/messages", app=sse.handle_post_message))
 
