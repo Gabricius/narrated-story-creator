@@ -9,3 +9,4 @@ misaki[zh]
 misaki[jp]
 fastapi[standard]
 mcp[cli]
+playwright>=1.40.0
