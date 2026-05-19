@@ -2706,15 +2706,62 @@ def create_video_mcp(
 # ─────────────────────────────────────────────────────────────────────
 # THUMB MAKER — standalone manual thumbnail composer.
 #
-# Used by the Pipeline Manager "Thumb Maker" view. Reuses the SAME
-# infrastructure as JOB 5 of N8N: fetches the chosen row from
-# public.thumb_templates (html_template + global_css + canvas dims +
-# shapes), builds the full HTML the same way "Montar HTML HCTI" does,
-# and POSTs to the thumb-renderer service to get the PNG back. The PNG
-# is then streamed to the browser. The browser only talks to server.py.
+# Used by the Pipeline Manager "Thumb Maker" view. Fetches the chosen
+# row from public.thumb_templates (html_template + global_css + canvas
+# dims + shapes), builds the full HTML the same way the JOB 5 "Montar
+# HTML HCTI" node does, then renders it to PNG with Playwright/Chromium
+# running inside THIS container. No external service dependency, no
+# Supabase round-trip — the PNG is streamed straight to the browser.
 # ─────────────────────────────────────────────────────────────────────
 
-THUMB_RENDERER_URL = os.environ.get("THUMB_RENDERER_URL", "http://thumb-renderer:3000")
+# Singleton Chromium browser (lazy-initialized, reused across requests).
+# Async-locked so concurrent requests don't race the launch.
+_thumb_playwright_ctx = None
+_thumb_browser = None
+_thumb_browser_lock: asyncio.Lock | None = None
+
+
+async def _get_thumb_browser():
+    """Return a connected Chromium instance, launching it on first use."""
+    from playwright.async_api import async_playwright
+
+    global _thumb_playwright_ctx, _thumb_browser, _thumb_browser_lock
+    if _thumb_browser_lock is None:
+        _thumb_browser_lock = asyncio.Lock()
+    async with _thumb_browser_lock:
+        if _thumb_browser is not None and _thumb_browser.is_connected():
+            return _thumb_browser
+        if _thumb_playwright_ctx is None:
+            _thumb_playwright_ctx = await async_playwright().start()
+        _thumb_browser = await _thumb_playwright_ctx.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-zygote",
+            ],
+        )
+        return _thumb_browser
+
+
+async def _render_html_to_png(html: str, width: int = 1280, height: int = 720,
+                              ms_delay: int = 500) -> bytes:
+    """Render an HTML document to a PNG screenshot using the shared Chromium."""
+    browser = await _get_thumb_browser()
+    page = await browser.new_page(viewport={"width": width, "height": height})
+    try:
+        await page.set_content(html, wait_until="networkidle", timeout=30000)
+        if ms_delay > 0:
+            await asyncio.sleep(ms_delay / 1000.0)
+        return await page.screenshot(
+            type="png",
+            clip={"x": 0, "y": 0, "width": width, "height": height},
+        )
+    finally:
+        await page.close()
 
 
 def _thumb_supabase_get(path: str, params: dict | None = None):
@@ -2839,7 +2886,7 @@ def _thumb_guess_image_mime(image_bytes: bytes) -> str:
 
 
 @app.post("/api/thumb-make")
-def thumb_make(req: dict):
+async def thumb_make(req: dict):
     """Render one of the templates from public.thumb_templates with a manually
     uploaded image and a hand-typed formatted_context. Returns the PNG.
 
@@ -2889,73 +2936,18 @@ def thumb_make(req: dict):
 
     full_html = _thumb_build_full_html(template, formatted_context, hook, data_url)
 
-    # Forward to thumb-renderer using the EXISTING /render endpoint (same one
-    # JOB 5 of N8N uses in production — no modification needed to that service).
-    # /render uploads the PNG to a Supabase bucket and returns a public URL.
-    # We then download that PNG and stream it to the browser, and delete the
-    # storage object so manual renders don't accumulate in the bucket.
-    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
-    supabase_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    if not supabase_url or not supabase_key:
-        return JSONResponse(
-            content={"error": "SUPABASE_URL / SUPABASE_SERVICE_KEY não configurados no env"},
-            status_code=500,
-        )
-    bucket = os.environ.get("THUMB_MAKE_BUCKET", "thumbnails")
-    filename = f"manual_{uuid.uuid4().hex[:12]}.png"
-
+    # Render in-process with Playwright/Chromium (installed in the container
+    # via `playwright install --with-deps chromium`). No external service,
+    # no Supabase round-trip — just bytes back to the browser.
     try:
-        renderer_resp = requests.post(
-            f"{THUMB_RENDERER_URL.rstrip('/')}/render",
-            json={
-                "html": full_html,
-                "viewport_width": int(template.get("canvas_width") or 1280),
-                "viewport_height": int(template.get("canvas_height") or 720),
-                "ms_delay": 500,
-                "filename": filename,
-                "supabase_url": supabase_url,
-                "supabase_key": supabase_key,
-                "supabase_bucket": bucket,
-            },
-            timeout=60,
+        png_bytes = await _render_html_to_png(
+            full_html,
+            width=int(template.get("canvas_width") or 1280),
+            height=int(template.get("canvas_height") or 720),
+            ms_delay=500,
         )
     except Exception as e:
-        return JSONResponse(content={"error": f"thumb-renderer indisponível: {e}"}, status_code=502)
-
-    if not renderer_resp.ok:
-        body_text = renderer_resp.text[:500]
-        return JSONResponse(
-            content={"error": f"thumb-renderer falhou ({renderer_resp.status_code}): {body_text}"},
-            status_code=502,
-        )
-
-    try:
-        renderer_payload = renderer_resp.json()
-        png_url = renderer_payload.get("url")
-        if not png_url:
-            raise RuntimeError("thumb-renderer não devolveu 'url' no payload")
-    except Exception as e:
-        return JSONResponse(content={"error": f"resposta inválida do thumb-renderer: {e}"}, status_code=502)
-
-    # Fetch the PNG bytes back
-    try:
-        png_resp = requests.get(png_url, timeout=30)
-        if not png_resp.ok:
-            raise RuntimeError(f"HTTP {png_resp.status_code}")
-        png_bytes = png_resp.content
-    except Exception as e:
-        return JSONResponse(content={"error": f"falha baixando PNG do Supabase: {e}"}, status_code=502)
-
-    # Best-effort cleanup: remove the storage object so manual renders
-    # don't pile up. We don't fail the request if delete fails.
-    try:
-        requests.delete(
-            f"{supabase_url}/storage/v1/object/{bucket}/{filename}",
-            headers={"Authorization": f"Bearer {supabase_key}", "apikey": supabase_key},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"[thumb-make] cleanup failed (ignored): {e}")
+        return JSONResponse(content={"error": f"render falhou: {e}"}, status_code=500)
 
     import io as _io
     return StreamingResponse(
