@@ -2890,9 +2890,9 @@ def _thumb_build_full_html(template: dict, formatted_context: str,
     )
     css = global_css.replace("{{background_image}}", background_image_url or "")
 
-    # Auto-inject Google Fonts if not imported (handles Oswald, Bebas Neue, and Archivo Black)
+    # Auto-inject Google Fonts if not imported (handles Oswald, Bebas Neue, Archivo Black, and Anton)
     if "@import" not in css and "fonts.googleapis.com" not in css:
-        css = "@import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Bebas+Neue&family=Oswald:wght@200;300;400;500;600;700;800;900&display=swap');\n" + css
+        css = "@import url('https://fonts.googleapis.com/css2?family=Anton&family=Archivo+Black&family=Bebas+Neue&family=Oswald:wght@200;300;400;500;600;700;800;900&display=swap');\n" + css
 
     # Auto-inject stroke fix for top layer overlay to prevent thin/eaten letters
     if "._text-top" in css and "-webkit-text-stroke: 0" not in css:
