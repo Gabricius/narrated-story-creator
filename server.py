@@ -2894,6 +2894,27 @@ def _thumb_build_full_html(template: dict, formatted_context: str,
     if "@import" not in css and "fonts.googleapis.com" not in css:
         css = "@import url('https://fonts.googleapis.com/css2?family=Anton&family=Archivo+Black&family=Bebas+Neue&family=Oswald:wght@200;300;400;500;600;700;800;900&display=swap');\n" + css
 
+    # Ensure font-family fallbacks and weights are correct for fixed-weight fonts
+    import re
+    # Add Google Font fallbacks to font-family declarations if not present
+    css = css.replace('"Arial Black", Arial, sans-serif', '"Arial Black", "Archivo Black", Arial, sans-serif')
+    css = css.replace('"Arial Black",Arial,sans-serif', '"Arial Black", "Archivo Black", Arial, sans-serif')
+    css = css.replace("font-family: 'Arial Black'", "font-family: 'Arial Black', 'Archivo Black'")
+    css = css.replace("font-family: ArialBlack", "font-family: 'Arial Black', 'Archivo Black'")
+    
+    css = css.replace('Impact, "Arial Narrow", sans-serif', 'Impact, Anton, "Arial Narrow", sans-serif')
+    css = css.replace('Impact,\"Arial Narrow\",sans-serif', 'Impact, Anton, "Arial Narrow", sans-serif')
+    css = css.replace("font-family: 'Impact'", "font-family: 'Impact', 'Anton'")
+
+    # For selectors referencing fixed-weight fonts, force font-weight: normal to prevent Chromium fallback bugs
+    for font_keyword in ['Arial Black', 'Archivo Black', 'Impact', 'Anton', 'Bebas Neue']:
+        def font_weight_replacer(match):
+            block_content = match.group(0)
+            if font_keyword in block_content:
+                block_content = re.sub(r'font-weight\s*:\s*[^;!]+(?:!\s*important)?\s*;?', 'font-weight: normal !important;', block_content)
+            return block_content
+        css = re.sub(r'[^{}]+\{[^{}]+\}', font_weight_replacer, css)
+
     # Auto-inject stroke fix for top layer overlay to prevent thin/eaten letters
     if "._text-top" in css and "-webkit-text-stroke: 0" not in css:
         css += "\n.text-block._text-top { -webkit-text-stroke: 0 transparent !important; paint-order: normal !important; }\n"
