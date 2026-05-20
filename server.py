@@ -2244,6 +2244,16 @@ def flow_token_status():
     }
 
 
+@app.get("/api/flow-token-get")
+def flow_token_get():
+    """Pop a fresh reCAPTCHA token from the pool for testing."""
+    tokens = _consume_recaptcha_tokens(1)
+    if not tokens:
+        return JSONResponse(content={"error": "no fresh tokens in pool"}, status_code=503)
+    return {"token": tokens[0]}
+
+
+
 def flow_get_token(cookie: str) -> dict:
     """Trocar session cookie por access_token via labs.google.
 
