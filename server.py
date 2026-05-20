@@ -1161,6 +1161,38 @@ def process_video_queue():
                                 print(f"[V4] Warning: effect layer "
                                       f"'{layer.get('label', layer.get('id', '?'))}' could not be resolved")
 
+                        # --- Intro videos (Veo 3.1 via Flow) ---
+                        # 2026-05-20: download dos clips IA e passe pro render como intro.
+                        # `intro_video_urls` deve ser lista de URLs públicas (geralmente do
+                        # bucket flow-videos no Supabase Storage). JOB 4 envia esses URLs no
+                        # payload quando o canal tem intro_video_enabled=true.
+                        intro_video_paths = []
+                        raw_intro_urls = data.get("intro_video_urls") or []
+                        # Compat: também aceita campo singular `intro_video_url` (string)
+                        if not raw_intro_urls and data.get("intro_video_url"):
+                            raw_intro_urls = [data["intro_video_url"]]
+                        for i, url in enumerate(raw_intro_urls):
+                            if not url:
+                                continue
+                            try:
+                                local_intro = os.path.join(video_dir, f"intro_{i}.mp4")
+                                resp_dl = requests.get(url, timeout=120, stream=True)
+                                if resp_dl.status_code == 200:
+                                    with open(local_intro, "wb") as f_intro:
+                                        for chunk in resp_dl.iter_content(chunk_size=64 * 1024):
+                                            if chunk:
+                                                f_intro.write(chunk)
+                                    intro_video_paths.append(local_intro)
+                                    print(f"[V4 Intro] downloaded intro {i}: {url[:80]} → {local_intro} "
+                                          f"({os.path.getsize(local_intro)} bytes)")
+                                else:
+                                    print(f"[V4 Intro] WARN: download intro {i} HTTP {resp_dl.status_code} — skipping")
+                            except Exception as e:
+                                print(f"[V4 Intro] WARN: failed to download intro {i} ({url[:80]}): {e} — skipping")
+
+                        overlay_during_intro = bool(data.get("overlay_during_intro", True))
+                        subtitle_during_intro = bool(data.get("subtitle_during_intro", True))
+
                         success = render_video_v4(
                             bg_paths=bg_paths,
                             overlay_path=overlay_path,
@@ -1170,6 +1202,9 @@ def process_video_queue():
                             audio_length=audio_length,
                             effect_layers_resolved=effect_layers_resolved if effect_layers_resolved else None,
                             progress_callback=_render_progress,
+                            intro_video_paths=intro_video_paths if intro_video_paths else None,
+                            overlay_during_intro=overlay_during_intro,
+                            subtitle_during_intro=subtitle_during_intro,
                         )
                         if not success:
                             raise RuntimeError("[RENDER-V4] render_video_v4 returned False")
@@ -1749,10 +1784,15 @@ os.makedirs(FLOW_IMAGES_DIR, exist_ok=True)
 IMAGEFX_IMAGES_DIR = os.path.join(os.getcwd(), "imagefx_output")
 os.makedirs(IMAGEFX_IMAGES_DIR, exist_ok=True)
 
-# Supabase Storage for persistent image storage
+# Supabase Storage for persistent image / video storage
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 IMAGEFX_BUCKET = "imagefx"  # mantido (URLs já em produção apontam para este bucket)
+# 2026-05-20: bucket separado para MP4 gerados por Veo 3.1 via /api/generate-video.
+# Mantido fora do `imagefx` para permitir lifecycle/retention diferente no futuro.
+FLOW_VIDEOS_BUCKET = "flow-videos"
+FLOW_VIDEOS_DIR = os.path.join(os.getcwd(), "flow_videos_output")
+os.makedirs(FLOW_VIDEOS_DIR, exist_ok=True)
 
 def update_production_progress(production_id: str, progress: dict):
     """Update processing_progress JSONB on the productions row in Supabase.
@@ -1777,43 +1817,53 @@ def update_production_progress(production_id: str, progress: dict):
     except Exception:
         pass
 
-def ensure_supabase_bucket():
-    """Create imagefx bucket in Supabase Storage if it doesn't exist."""
+def ensure_supabase_bucket(bucket_name: str = None):
+    """Ensure a Supabase Storage bucket exists (create if missing, public).
+
+    Args:
+      bucket_name: nome do bucket; default = IMAGEFX_BUCKET (retro-compat).
+    Returns:
+      True se existir ou foi criado; False em qualquer erro.
+    """
+    if bucket_name is None:
+        bucket_name = IMAGEFX_BUCKET
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         return False
+    log_prefix = f"[Storage:{bucket_name}]"
     try:
         # Check if bucket exists
         resp = requests.get(
-            f"{SUPABASE_URL}/storage/v1/bucket/{IMAGEFX_BUCKET}",
+            f"{SUPABASE_URL}/storage/v1/bucket/{bucket_name}",
             headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
             timeout=10
         )
         if resp.status_code == 200:
-            print(f"[ImageFX] Supabase bucket '{IMAGEFX_BUCKET}' exists")
+            print(f"{log_prefix} bucket exists")
             return True
-        
-        # Create bucket
+
+        # Create bucket (public)
         resp = requests.post(
             f"{SUPABASE_URL}/storage/v1/bucket",
             headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"},
-            json={"id": IMAGEFX_BUCKET, "name": IMAGEFX_BUCKET, "public": True},
+            json={"id": bucket_name, "name": bucket_name, "public": True},
             timeout=10
         )
         if resp.status_code in (200, 201):
-            print(f"[ImageFX] Created Supabase bucket '{IMAGEFX_BUCKET}' (public)")
+            print(f"{log_prefix} created (public)")
             return True
         else:
-            print(f"[ImageFX] Failed to create bucket: {resp.status_code} {resp.text[:200]}")
+            print(f"{log_prefix} failed to create: {resp.status_code} {resp.text[:200]}")
             return False
     except Exception as e:
-        print(f"[ImageFX] Bucket check error: {e}")
+        print(f"{log_prefix} check error: {e}")
         return False
 
-# Try to create bucket on startup
+# Try to create buckets on startup
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    ensure_supabase_bucket()
+    ensure_supabase_bucket(IMAGEFX_BUCKET)
+    ensure_supabase_bucket(FLOW_VIDEOS_BUCKET)
 else:
-    print("[ImageFX] Supabase Storage not configured — images will be local only")
+    print("[Storage] Supabase Storage not configured — images/videos will be local only")
 
 
 # ═══════════════════════════════
@@ -2033,30 +2083,46 @@ def resolve_effect_layer(layer: dict, video_dir: str) -> dict | None:
     }
 
 
-def upload_to_supabase_storage(image_bytes: bytes, filename: str, content_type: str = "image/png") -> str | None:
-    """Upload image to Supabase Storage bucket. Returns public URL or None on failure."""
+def upload_to_supabase_storage(
+    image_bytes: bytes,
+    filename: str,
+    content_type: str = "image/png",
+    bucket: str = None,
+    timeout: int = 30,
+) -> str | None:
+    """Upload bytes to Supabase Storage bucket. Returns public URL or None on failure.
+
+    Args:
+      image_bytes: payload (image OR video bytes).
+      filename: nome do arquivo dentro do bucket.
+      content_type: MIME type (e.g., 'image/png', 'video/mp4').
+      bucket: nome do bucket; default = IMAGEFX_BUCKET (retro-compat).
+      timeout: timeout HTTP em segundos (vídeos podem ser maiores, default 30s mantém OK até ~30MB).
+    """
+    if bucket is None:
+        bucket = IMAGEFX_BUCKET
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("[ImageFX] Supabase Storage not configured, skipping upload")
+        print(f"[Storage:{bucket}] Supabase Storage not configured, skipping upload")
         return None
     try:
         resp = requests.post(
-            f"{SUPABASE_URL}/storage/v1/object/{IMAGEFX_BUCKET}/{filename}",
+            f"{SUPABASE_URL}/storage/v1/object/{bucket}/{filename}",
             headers={
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                 "Content-Type": content_type,
                 "x-upsert": "true",
             },
             data=image_bytes,
-            timeout=30,
+            timeout=timeout,
         )
         if resp.status_code in (200, 201):
-            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{IMAGEFX_BUCKET}/{filename}"
+            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{filename}"
             return public_url
         else:
-            print(f"[ImageFX] Supabase upload failed: {resp.status_code} {resp.text[:200]}")
+            print(f"[Storage:{bucket}] upload failed: {resp.status_code} {resp.text[:200]}")
             return None
     except Exception as e:
-        print(f"[ImageFX] Supabase upload error: {e}")
+        print(f"[Storage:{bucket}] upload error: {e}")
         return None
 
 
@@ -2110,10 +2176,29 @@ MODEL_MAP = {
 
 # Pool de tokens reCAPTCHA Enterprise alimentado pela flow-token-extension Chrome.
 # Cada token é tipicamente single-use no servidor e válido por ~120s.
-_recaptcha_pool: list[dict] = []
+#
+# 2026-05-20: pool foi particionado por *action* do reCAPTCHA. A página do Flow gera
+# tokens com action='IMAGE_GENERATION' para chamadas de imagem e action='VIDEO_GENERATION'
+# para chamadas de vídeo (descoberto inspecionando o bundle do labs.google).
+# Misturar actions dispara PUBLIC_ERROR_UNUSUAL_ACTIVITY no backend Google.
+_RECAPTCHA_ACTION_DEFAULT = "IMAGE_GENERATION"
+_RECAPTCHA_ACTION_VIDEO = "VIDEO_GENERATION"
+_recaptcha_pools: dict[str, list[dict]] = {}  # action → list of {token, received_at, used}
 _recaptcha_pool_lock = threading.Lock()
 _RECAPTCHA_POOL_MAX = 12
 _RECAPTCHA_TTL = 110.0  # margem antes da expiração real (~120s)
+
+
+def _normalize_recaptcha_action(action: str | None) -> str:
+    """Normaliza action; aceita 'video'/'image' como atalho da UI."""
+    if not action:
+        return _RECAPTCHA_ACTION_DEFAULT
+    a = action.strip().upper()
+    if a in ("VIDEO", "VIDEO_GENERATION"):
+        return _RECAPTCHA_ACTION_VIDEO
+    if a in ("IMAGE", "IMAGE_GENERATION"):
+        return _RECAPTCHA_ACTION_DEFAULT
+    return a  # action customizada (futura)
 
 
 def _flow_get_project_id() -> str:
@@ -2139,12 +2224,14 @@ def _flow_get_project_id() -> str:
     return DEFAULT
 
 
-def _consume_recaptcha_tokens(n: int) -> list[str]:
-    """Tira até N tokens não-usados não-expirados do pool. Mais recentes primeiro."""
+def _consume_recaptcha_tokens(n: int, action: str = _RECAPTCHA_ACTION_DEFAULT) -> list[str]:
+    """Tira até N tokens não-usados não-expirados do pool da action. Mais recentes primeiro."""
+    action = _normalize_recaptcha_action(action)
     now = time.time()
     out: list[str] = []
     with _recaptcha_pool_lock:
-        for entry in reversed(_recaptcha_pool):
+        pool = _recaptcha_pools.get(action, [])
+        for entry in reversed(pool):
             if entry["used"]:
                 continue
             if now - entry["received_at"] >= _RECAPTCHA_TTL:
@@ -2156,33 +2243,42 @@ def _consume_recaptcha_tokens(n: int) -> list[str]:
     return out
 
 
-def _wait_for_recaptcha_tokens(n: int, timeout: float = 30.0) -> list[str]:
-    """Pede N tokens; espera até timeout enquanto a extension entrega novos."""
+def _wait_for_recaptcha_tokens(n: int, timeout: float = 30.0, action: str = _RECAPTCHA_ACTION_DEFAULT) -> list[str]:
+    """Pede N tokens da action; espera até timeout enquanto a extension entrega novos."""
     deadline = time.time() + timeout
-    tokens = _consume_recaptcha_tokens(n)
+    tokens = _consume_recaptcha_tokens(n, action=action)
     while len(tokens) < n and time.time() < deadline:
         time.sleep(1.0)
-        more = _consume_recaptcha_tokens(n - len(tokens))
+        more = _consume_recaptcha_tokens(n - len(tokens), action=action)
         tokens.extend(more)
     return tokens
 
 
 @app.post("/api/flow-token-set")
 def flow_token_set(req: dict):
-    """Endpoint chamado pela flow-token-extension a cada token reCAPTCHA novo."""
+    """Endpoint chamado pela flow-token-extension a cada token reCAPTCHA novo.
+
+    Body:
+      token: string (obrigatório) — token gerado por grecaptcha.enterprise.execute
+      action: string (opcional) — 'IMAGE_GENERATION' (default) ou 'VIDEO_GENERATION'
+              Extensões v1.1 e anteriores não enviam → cai no default = image (retro-compat).
+      generated_at: int (opcional) — timestamp ms da geração (informativo)
+    """
     token = (req.get("token") or "").strip()
     if not token:
         return JSONResponse(content={"error": "empty token"}, status_code=400)
+    action = _normalize_recaptcha_action(req.get("action"))
     with _recaptcha_pool_lock:
-        _recaptcha_pool.append({"token": token, "received_at": time.time(), "used": False})
+        pool = _recaptcha_pools.setdefault(action, [])
+        pool.append({"token": token, "received_at": time.time(), "used": False})
         # Trim pool: descartar usados e expirados, manter no máx _RECAPTCHA_POOL_MAX recentes
         now = time.time()
-        _recaptcha_pool[:] = [
-            e for e in _recaptcha_pool
+        _recaptcha_pools[action] = [
+            e for e in pool
             if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL
         ][-_RECAPTCHA_POOL_MAX:]
-        pool_size = len(_recaptcha_pool)
-    return {"success": True, "pool_size": pool_size}
+        pool_size = len(_recaptcha_pools[action])
+    return {"success": True, "pool_size": pool_size, "action": action}
 
 
 @app.post("/api/flow-cookie-set")
@@ -2230,27 +2326,51 @@ def flow_cookie_set(req: dict):
 
 
 @app.get("/api/flow-token-status")
-def flow_token_status():
-    """UI consulta para mostrar estado do pool."""
+def flow_token_status(action: str | None = None):
+    """UI/extension consulta para mostrar estado do pool.
+
+    Query:
+      action: 'image' (default) | 'video' — qual pool consultar
+              Sem action: retorna estado do pool image (retro-compat) +
+              campo 'pools' com todos os pools rastreados.
+    """
     now = time.time()
+    action_norm = _normalize_recaptcha_action(action)
     with _recaptcha_pool_lock:
-        valid = [e for e in _recaptcha_pool if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL]
-        most_recent = max((e["received_at"] for e in _recaptcha_pool), default=0)
+        # Snapshot de todos os pools (para diagnóstico/UI dual)
+        all_pools: dict[str, dict] = {}
+        for act, pool in _recaptcha_pools.items():
+            valid = [e for e in pool if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL]
+            most_recent = max((e["received_at"] for e in pool), default=0)
+            all_pools[act] = {
+                "pool_size": len(valid),
+                "total_tracked": len(pool),
+                "most_recent_age_seconds": (now - most_recent) if most_recent else None,
+                "has_fresh_tokens": len(valid) > 0,
+            }
+        target = all_pools.get(action_norm, {
+            "pool_size": 0, "total_tracked": 0,
+            "most_recent_age_seconds": None, "has_fresh_tokens": False,
+        })
     return {
-        "pool_size": len(valid),
-        "total_tracked": len(_recaptcha_pool),
-        "most_recent_age_seconds": (now - most_recent) if most_recent else None,
-        "has_fresh_tokens": len(valid) > 0,
+        **target,           # retro-compat: pool_size, has_fresh_tokens, etc. no top-level
+        "action": action_norm,
+        "pools": all_pools, # snapshot de todas as actions rastreadas
     }
 
 
 @app.get("/api/flow-token-get")
-def flow_token_get():
-    """Pop a fresh reCAPTCHA token from the pool for testing."""
-    tokens = _consume_recaptcha_tokens(1)
+def flow_token_get(action: str | None = None):
+    """Pop a fresh reCAPTCHA token from the pool for testing.
+
+    Query:
+      action: 'image' (default) | 'video' — qual pool extrair.
+    """
+    action_norm = _normalize_recaptcha_action(action)
+    tokens = _consume_recaptcha_tokens(1, action=action_norm)
     if not tokens:
-        return JSONResponse(content={"error": "no fresh tokens in pool"}, status_code=503)
-    return {"token": tokens[0]}
+        return JSONResponse(content={"error": f"no fresh tokens in pool '{action_norm}'"}, status_code=503)
+    return {"token": tokens[0], "action": action_norm}
 
 
 
@@ -2564,6 +2684,10 @@ def generate_flow(req: dict):
                 "image_url": public_url or f"/api/flow/{filename}",
                 "size_bytes": len(img_bytes),
                 "content_type": content_type,
+                # 2026-05-20: mediaId do Flow é preservado aqui para que callers possam
+                # reaproveitar a imagem como referenceImages.mediaId em /api/generate-video.
+                # Isso é o que garante "mesma personagem da thumb aparece no intro_video".
+                "media_id": r.get("media_id"),
             }
         )
 
@@ -2594,6 +2718,11 @@ def generate_flow(req: dict):
         "model": model_raw,
         "aspect_ratio": aspect_ratio_raw,
         "failures": len(failures),
+        # 2026-05-20: novos campos para integração com /api/generate-video.
+        # `media_id` é o mediaId do Flow da imagem principal — pode ser usado como
+        # `reference_media_id` no submit de vídeo (mantém personagem consistente).
+        "media_id": primary.get("media_id"),
+        "all_media_ids": [s.get("media_id") for s in saved_images],
     }
 
 
@@ -2701,6 +2830,458 @@ def test_flow_token(req: dict):
         "user": user_name,
         "auth_expired": result.get("auth_expired", False),
         "recaptcha_rejected": result.get("recaptcha_rejected", False),
+    }
+
+
+### ═══════════════════════════════════════════════════════════════════════
+### Google Flow Video Generation (Veo 3.1 — Lite/Fast/Quality)
+### ═══════════════════════════════════════════════════════════════════════
+### Pipeline: cookie → Bearer (existing flow_get_token) → reCAPTCHA fresh
+###           (action=VIDEO_GENERATION) → submit batchAsyncGenerate... →
+###           poll batchCheckAsync... (MEDIA_GENERATION_STATUS_SUCCESSFUL) →
+###           GET /v1/media/{mediaId} (returns base64-encoded MP4 inline) →
+###           decode + upload Supabase Storage bucket flow-videos.
+### Validação E2E: 2026-05-20 — vídeo gerado e baixado em ~9s (Veo Lite).
+
+# Aspect ratio map (vídeo aceita LANDSCAPE / PORTRAIT / SQUARE)
+VIDEO_ASPECT_RATIO_MAP = {
+    "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+    "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
+    "1:1":  "VIDEO_ASPECT_RATIO_SQUARE",
+    # legacy
+    "LANDSCAPE": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+    "PORTRAIT":  "VIDEO_ASPECT_RATIO_PORTRAIT",
+    "SQUARE":    "VIDEO_ASPECT_RATIO_SQUARE",
+}
+
+# Modelos válidos do Veo 3.1 (custos em créditos por geração — plano AI Pro)
+VIDEO_MODEL_KEYS = {
+    "veo_3_1_r2v_lite":    {"credits": 10,  "label": "Veo 3.1 Lite"},
+    "veo_3_1_r2v_fast":    {"credits": 80,  "label": "Veo 3.1 Fast"},
+    "veo_3_1_r2v_quality": {"credits": 400, "label": "Veo 3.1 Quality"},
+    # Omniflash (modelo experimental, custo conhecido: 100 créditos)
+    "omniflash":           {"credits": 100, "label": "OmniFlash"},
+}
+
+VIDEO_DEFAULT_HEADERS = FLOW_DEFAULT_HEADERS  # mesmos headers do endpoint de imagem
+
+
+def _flow_video_submit(
+    *,
+    access_token: str,
+    recaptcha_token: str,
+    project_id: str,
+    prompt: str,
+    model_key: str,
+    aspect_ratio: str,
+    seed: int,
+    reference_media_id: str | None = None,
+) -> dict:
+    """Submete uma geração de vídeo (1 request) e retorna o operation/media handle.
+
+    Retorna:
+      { ok: True, media_id, workflow_id, remaining_credits }
+      ou
+      { ok: False, error, status_code?, auth_expired?, recaptcha_rejected? }
+    """
+    batch_id = str(uuid.uuid4())
+    session_id = f";{int(time.time() * 1000)}"
+    requests_arr = [{
+        "aspectRatio": aspect_ratio,
+        "textInput": {"structuredPrompt": {"parts": [{"text": prompt}]}},
+        "videoModelKey": model_key,
+        "seed": seed,
+        "metadata": {},
+    }]
+    if reference_media_id:
+        requests_arr[0]["referenceImages"] = [{
+            "mediaId": reference_media_id,
+            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+        }]
+
+    payload = {
+        "mediaGenerationContext": {
+            "batchId": batch_id,
+            "audioFailurePreference": "BLOCK_SILENCED_VIDEOS",
+        },
+        "clientContext": {
+            "projectId": project_id,
+            "tool": "PINHOLE",
+            "userPaygateTier": "PAYGATE_TIER_ONE",
+            "sessionId": session_id,
+            "recaptchaContext": {
+                "token": recaptcha_token,
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            },
+        },
+        "requests": requests_arr,
+        "useV2ModelConfig": True,
+    }
+    headers = {**VIDEO_DEFAULT_HEADERS, "Authorization": f"Bearer {access_token}"}
+    url = "https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoReferenceImages"
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=60)
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": "submit timeout (60s)"}
+    except Exception as e:
+        return {"ok": False, "error": f"submit request failed: {e}"}
+
+    if resp.status_code in (401, 403):
+        recaptcha_rejected = False
+        if resp.status_code == 403:
+            try:
+                details = resp.json().get("error", {}).get("details", [])
+                reason = (details[0].get("reason", "") if details else "")
+                recaptcha_rejected = "UNUSUAL_ACTIVITY" in reason or "RECAPTCHA" in reason.upper()
+            except Exception:
+                pass
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+            "auth_expired": resp.status_code == 401,
+            "recaptcha_rejected": recaptcha_rejected,
+        }
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "status_code": resp.status_code,
+            "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+        }
+    try:
+        data = resp.json()
+    except Exception:
+        return {"ok": False, "error": "submit non-JSON response"}
+
+    media = data.get("media") or []
+    if not media:
+        return {"ok": False, "error": "submit response has no media", "raw_keys": list(data.keys())}
+    return {
+        "ok": True,
+        "media_id": media[0].get("name"),
+        "workflow_id": media[0].get("workflowId"),
+        "project_id": media[0].get("projectId") or project_id,
+        "remaining_credits": data.get("remainingCredits"),
+    }
+
+
+def _flow_video_poll(
+    *,
+    access_token: str,
+    media_id: str,
+    project_id: str,
+    timeout_s: int = 180,
+    interval_s: float = 5.0,
+) -> dict:
+    """Polling do status até `MEDIA_GENERATION_STATUS_SUCCESSFUL` ou erro/timeout.
+
+    Veo Lite tipicamente fica pronto em 9-15s. Vídeos Fast/Quality podem demorar mais.
+    """
+    url = "https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus"
+    headers = {**VIDEO_DEFAULT_HEADERS, "Authorization": f"Bearer {access_token}"}
+    payload = {"media": [{"name": media_id, "projectId": project_id}]}
+    deadline = time.time() + timeout_s
+    last_status = "?"
+    polls = 0
+    while time.time() < deadline:
+        polls += 1
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        except Exception as e:
+            print(f"[Flow Video] poll #{polls} request error: {e}")
+            time.sleep(interval_s)
+            continue
+        if resp.status_code != 200:
+            print(f"[Flow Video] poll #{polls} HTTP {resp.status_code}: {resp.text[:200]}")
+            time.sleep(interval_s)
+            continue
+        try:
+            data = resp.json()
+            m = (data.get("media") or [{}])[0]
+            last_status = (
+                m.get("mediaMetadata", {}).get("mediaStatus", {}).get("mediaGenerationStatus", "?")
+            )
+        except Exception as e:
+            print(f"[Flow Video] poll #{polls} parse error: {e}")
+            time.sleep(interval_s)
+            continue
+        if last_status == "MEDIA_GENERATION_STATUS_SUCCESSFUL":
+            return {"ok": True, "polls": polls, "status": last_status}
+        if last_status in ("MEDIA_GENERATION_STATUS_FAILED", "MEDIA_GENERATION_STATUS_ERROR"):
+            return {"ok": False, "status": last_status, "error": "generation failed", "polls": polls}
+        time.sleep(interval_s)
+    return {"ok": False, "error": f"timeout {timeout_s}s, last status: {last_status}", "polls": polls}
+
+
+def _flow_video_fetch_mp4(*, access_token: str, media_id: str) -> dict:
+    """GET v1/media/{mediaId} retorna JSON com video.encodedVideo (base64 do MP4).
+
+    Retorna { ok, mp4_bytes, duration, model, seed } ou { ok: False, error }.
+    """
+    url = f"https://aisandbox-pa.googleapis.com/v1/media/{media_id}"
+    headers = {**VIDEO_DEFAULT_HEADERS, "Authorization": f"Bearer {access_token}"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=120)
+    except Exception as e:
+        return {"ok": False, "error": f"fetch error: {e}"}
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"fetch HTTP {resp.status_code}: {resp.text[:300]}"}
+    try:
+        data = resp.json()
+    except Exception:
+        return {"ok": False, "error": "fetch non-JSON response"}
+    b64 = (data.get("video") or {}).get("encodedVideo")
+    if not b64:
+        return {"ok": False, "error": "no encodedVideo in response"}
+    try:
+        mp4 = base64.b64decode(b64)
+    except Exception as e:
+        return {"ok": False, "error": f"base64 decode failed: {e}"}
+    # Validação básica: magic bytes do MP4 (ftypisom / ftyp...)
+    if len(mp4) < 32 or b"ftyp" not in mp4[:32]:
+        return {"ok": False, "error": "decoded bytes are not a valid MP4"}
+    gv = (data.get("video") or {}).get("generatedVideo", {})
+    return {
+        "ok": True,
+        "mp4_bytes": mp4,
+        "model": gv.get("model"),
+        "seed": gv.get("seed"),
+        "aspect_ratio": gv.get("aspectRatio"),
+    }
+
+
+@app.post("/api/generate-video")
+def generate_flow_video(req: dict):
+    """Gera 1 vídeo de ~8s via Google Flow (Veo 3.1).
+
+    Body:
+      cookie: string (opcional — default lê system_config.flow_cookie)
+      prompt: string (obrigatório)
+      reference_media_id: string (opcional) — mediaId de uma imagem prévia
+                          (vinda de /api/generate-image) para usar como ASSET.
+                          Se ausente: text-to-video puro.
+      model: "veo_3_1_r2v_lite" (default) | "veo_3_1_r2v_fast" | "veo_3_1_r2v_quality"
+      aspect_ratio: "16:9" | "9:16" | "1:1" (default "16:9")
+      project_id: string (opcional override do system_config.flow_project_id)
+      poll_timeout_s: int (default 180)
+      production_id: string (opcional — só pra logging/progress tracking)
+
+    Retorna:
+      { success: true, video_id, video_url, media_id, model, credits_used,
+        remaining_credits, poll_seconds, size_bytes }
+      ou
+      { success: false, error, auth_expired?, recaptcha_rejected? } (status 200 — mesmo
+      padrão do /api/generate-image para Easypanel não trocar o body por HTML).
+    """
+    # 1. Cookie: do body ou system_config
+    cookie = (req.get("cookie") or "").strip()
+    if not cookie:
+        cookie = get_system_config("flow_cookie") or ""
+    cookie = re.sub(r"\s+", " ", cookie.replace("\r", "").replace("\n", " ")).strip()
+    if not cookie:
+        return JSONResponse(content={"success": False, "error": "Cookie de sessão indisponível (nem no body nem em system_config.flow_cookie)"}, status_code=400)
+
+    # 2. Validação dos campos
+    prompt = (req.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse(content={"success": False, "error": "prompt é obrigatório"}, status_code=400)
+    if len(prompt) > 4000:
+        return JSONResponse(content={"success": False, "error": "prompt excede 4000 chars"}, status_code=400)
+
+    model_key = (req.get("model") or "veo_3_1_r2v_lite").strip().lower()
+    if model_key not in VIDEO_MODEL_KEYS:
+        return JSONResponse(content={"success": False, "error": f"model inválido: {model_key}. Válidos: {list(VIDEO_MODEL_KEYS.keys())}"}, status_code=400)
+    model_meta = VIDEO_MODEL_KEYS[model_key]
+
+    aspect_raw = (req.get("aspect_ratio") or "16:9").strip()
+    aspect = VIDEO_ASPECT_RATIO_MAP.get(aspect_raw) or VIDEO_ASPECT_RATIO_MAP.get(aspect_raw.upper())
+    if not aspect:
+        return JSONResponse(content={"success": False, "error": f"aspect_ratio inválido: {aspect_raw}"}, status_code=400)
+
+    reference_media_id = (req.get("reference_media_id") or "").strip() or None
+    project_id = (req.get("project_id") or "").strip() or _flow_get_project_id()
+    poll_timeout_s = int(req.get("poll_timeout_s") or 180)
+    production_id = (req.get("production_id") or "").strip() or None
+
+    log_tag = f"[Flow Video {model_key}{' ref' if reference_media_id else ''}]"
+    print(f"{log_tag} submitting — prompt_len={len(prompt)} aspect={aspect} project={project_id[:8]}")
+
+    # 3. Cookie → access_token
+    try:
+        session_data = flow_get_token(cookie)
+        access_token = session_data["access_token"]
+    except Exception as e:
+        return JSONResponse(
+            content={"success": False, "error": f"Falha na autenticação: {e}", "auth_expired": True},
+            status_code=200,
+        )
+
+    # 4. Pega 1 token reCAPTCHA da action VIDEO_GENERATION (espera até 30s se pool vazio)
+    tokens = _wait_for_recaptcha_tokens(1, timeout=30.0, action=_RECAPTCHA_ACTION_VIDEO)
+    if not tokens:
+        return JSONResponse(
+            content={
+                "success": False,
+                "error": (
+                    "Pool de tokens reCAPTCHA (action=VIDEO_GENERATION) vazio. "
+                    "Verifique se a flow-token-extension v1.2+ está rodando com a aba do Flow aberta."
+                ),
+                "flow_token_missing": True,
+            },
+            status_code=200,
+        )
+
+    # 5. Submit
+    submit = _flow_video_submit(
+        access_token=access_token,
+        recaptcha_token=tokens[0],
+        project_id=project_id,
+        prompt=prompt,
+        model_key=model_key,
+        aspect_ratio=aspect,
+        seed=random.randint(1, 2 ** 31),
+        reference_media_id=reference_media_id,
+    )
+    if not submit.get("ok"):
+        print(f"{log_tag} submit failed: {submit.get('error')}")
+        return JSONResponse(content={"success": False, **submit}, status_code=200)
+    media_id = submit["media_id"]
+    print(f"{log_tag} submitted — mediaId={media_id} remainingCredits={submit.get('remaining_credits')}")
+
+    if production_id:
+        update_production_progress(production_id, {"stage": "flow_video", "step": "polling", "media_id": media_id})
+
+    # 6. Poll
+    t_poll_start = time.time()
+    poll = _flow_video_poll(
+        access_token=access_token,
+        media_id=media_id,
+        project_id=submit.get("project_id", project_id),
+        timeout_s=poll_timeout_s,
+    )
+    if not poll.get("ok"):
+        print(f"{log_tag} poll failed: {poll.get('error')}")
+        return JSONResponse(content={"success": False, "media_id": media_id, **poll}, status_code=200)
+    poll_seconds = round(time.time() - t_poll_start, 1)
+    print(f"{log_tag} ready in {poll_seconds}s ({poll.get('polls')} polls)")
+
+    # 7. Fetch MP4 (base64 inline)
+    if production_id:
+        update_production_progress(production_id, {"stage": "flow_video", "step": "downloading", "media_id": media_id})
+    fetched = _flow_video_fetch_mp4(access_token=access_token, media_id=media_id)
+    if not fetched.get("ok"):
+        return JSONResponse(content={"success": False, "media_id": media_id, **fetched}, status_code=200)
+    mp4_bytes = fetched["mp4_bytes"]
+    size_bytes = len(mp4_bytes)
+
+    # 8. Persist: local cache + Supabase Storage
+    video_id = f"{media_id[:8]}_{int(time.time())}"
+    filename = f"{video_id}.mp4"
+    try:
+        with open(os.path.join(FLOW_VIDEOS_DIR, filename), "wb") as f:
+            f.write(mp4_bytes)
+    except Exception as e:
+        print(f"{log_tag} local cache failed: {e}")
+    public_url = upload_to_supabase_storage(
+        mp4_bytes, filename, content_type="video/mp4",
+        bucket=FLOW_VIDEOS_BUCKET, timeout=60,
+    )
+    storage_type = "supabase" if public_url else "local"
+    print(f"{log_tag} saved ({size_bytes/1024/1024:.2f} MB, {storage_type})")
+
+    return {
+        "success": True,
+        "video_id": video_id,
+        "video_url": public_url or f"/api/flow-videos/{filename}",
+        "media_id": media_id,
+        "model": model_key,
+        "model_label": model_meta["label"],
+        "credits_used": model_meta["credits"],
+        "remaining_credits": submit.get("remaining_credits"),
+        "size_bytes": size_bytes,
+        "poll_seconds": poll_seconds,
+        "aspect_ratio": aspect_raw,
+        "reference_media_id": reference_media_id,
+        "seed": fetched.get("seed"),
+    }
+
+
+@app.get("/api/flow-videos/{video_filename}")
+def get_flow_video(video_filename: str):
+    """Serve um MP4 gerado pelo /api/generate-video (fallback do cache local)."""
+    # Aceita com ou sem extensão; assume .mp4 por padrão
+    if not video_filename.endswith(".mp4"):
+        video_filename = f"{video_filename}.mp4"
+    path = os.path.join(FLOW_VIDEOS_DIR, video_filename)
+    if not os.path.exists(path):
+        return JSONResponse(content={"error": "Video not found"}, status_code=404)
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.post("/api/test-video")
+def test_flow_video(req: dict):
+    """Smoke test: valida cookie + pool VIDEO_GENERATION + paygate tier + créditos.
+
+    Body: { "cookie": "<opcional, default system_config.flow_cookie>" }
+    Returns: { valid, message, user, email, credits_remaining, paygate_tier, ... }
+
+    NÃO faz submit de geração — apenas troca cookie por Bearer e bate em
+    /v1/credits. Não gasta créditos.
+    """
+    cookie = (req.get("cookie") or "").strip()
+    if not cookie:
+        cookie = get_system_config("flow_cookie") or ""
+    cookie = re.sub(r"\s+", " ", cookie.replace("\r", "").replace("\n", " ")).strip()
+    if not cookie:
+        return JSONResponse(content={"valid": False, "message": "Cookie indisponível"}, status_code=400)
+
+    try:
+        session_data = flow_get_token(cookie)
+        access_token = session_data["access_token"]
+        user_name = session_data.get("user", {}).get("name", "Unknown")
+        user_email = session_data.get("user", {}).get("email", "")
+        expires = session_data.get("expires", "")
+    except Exception as e:
+        return {"valid": False, "message": f"Autenticação falhou: {e}"}
+
+    # Pool check
+    now = time.time()
+    with _recaptcha_pool_lock:
+        video_pool = _recaptcha_pools.get(_RECAPTCHA_ACTION_VIDEO, [])
+        valid_tokens = [e for e in video_pool if not e["used"] and now - e["received_at"] < _RECAPTCHA_TTL]
+    has_video_tokens = len(valid_tokens) > 0
+
+    # Credits check (não gasta nada)
+    credits_remaining = None
+    paygate_tier = None
+    try:
+        resp = requests.get(
+            "https://aisandbox-pa.googleapis.com/v1/credits?key=AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY",
+            headers={**VIDEO_DEFAULT_HEADERS, "Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            jd = resp.json()
+            credits_remaining = jd.get("credits")
+            paygate_tier = jd.get("userPaygateTier")
+    except Exception as e:
+        print(f"[test-video] credits fetch error: {e}")
+
+    return {
+        "valid": bool(credits_remaining is not None and has_video_tokens),
+        "message": (
+            f"Cookie OK (user: {user_name}). "
+            f"Pool video: {len(valid_tokens)} tokens. "
+            f"Credits: {credits_remaining}. "
+            f"Paygate: {paygate_tier}."
+        ),
+        "user": user_name,
+        "email": user_email,
+        "expires": expires,
+        "credits_remaining": credits_remaining,
+        "paygate_tier": paygate_tier,
+        "video_pool_size": len(valid_tokens),
+        "has_video_tokens": has_video_tokens,
     }
 
 
