@@ -2890,6 +2890,36 @@ def _thumb_build_full_html(template: dict, formatted_context: str,
     )
     css = global_css.replace("{{background_image}}", background_image_url or "")
 
+    # Auto-inject Google Fonts if not imported (handles Oswald, Bebas Neue, and Archivo Black)
+    if "@import" not in css and "fonts.googleapis.com" not in css:
+        css = "@import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Bebas+Neue&family=Oswald:wght@200;300;400;500;600;700;800;900&display=swap');\n" + css
+
+    # Auto-inject stroke fix for top layer overlay to prevent thin/eaten letters
+    if "._text-top" in css and "-webkit-text-stroke: 0" not in css:
+        css += "\n.text-block._text-top { -webkit-text-stroke: 0 transparent !important; paint-order: normal !important; }\n"
+        css += "._text-top .s1, ._text-top .s2, ._text-top .s3, ._text-top .s4, ._text-top .s5, ._text-top .hook-inline { -webkit-text-stroke: 0 transparent !important; paint-order: normal !important; }\n"
+
+    # Auto-inject hook height flex container CSS & HTML wrapper styling if it is a hook layer
+    layers = template.get("layers") or []
+    hook_layers = [l for l in layers if l.get("slot") == "hook"]
+    for hl in hook_layers:
+        import re
+        sid = re.sub(r'[^a-zA-Z0-9_-]', '_', hl.get("id") or "")
+        hook_text_selector = f".{sid} .hook-text"
+        if hook_text_selector not in css:
+            va = hl.get("verticalAlign") or "top"
+            fj = "center" if va == "center" else "flex-end" if va == "bottom" else "flex-start"
+            ta = hl.get("textAlign") or "left"
+            ai = "center" if ta == "center" else "flex-end" if ta == "right" else "flex-start"
+            css += f"\n.{sid} .hook-text {{\n  height: 100% !important;\n  display: flex !important;\n  flex-direction: column !important;\n  justify-content: {fj} !important;\n  align-items: {ai} !important;\n}}\n"
+
+        target_str = f'class="{sid}"'
+        idx = html.find(target_str)
+        if idx != -1:
+            dbl_idx = html.find('class="_dbl-wrap"', idx, idx + 300)
+            if dbl_idx != -1 and 'style="height:100% !important;"' not in html[idx:dbl_idx+50]:
+                html = html[:dbl_idx] + 'style="height:100% !important;" ' + html[dbl_idx:]
+
     shapes_html = _thumb_serialize_shapes(shapes)
     body_content = (
         f'<div style="position:relative;width:100%;height:100%;overflow:hidden;">{html}{shapes_html}</div>'
