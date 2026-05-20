@@ -3218,7 +3218,7 @@ def get_flow_video(video_filename: str):
     return FileResponse(path, media_type="video/mp4")
 
 
-@app.post("/api/test-video")
+@app.post("/api/test-flow-video")
 def test_flow_video(req: dict):
     """Smoke test: valida cookie + pool VIDEO_GENERATION + paygate tier + créditos.
 
@@ -3227,6 +3227,9 @@ def test_flow_video(req: dict):
 
     NÃO faz submit de geração — apenas troca cookie por Bearer e bate em
     /v1/credits. Não gasta créditos.
+
+    NOTA (2026-05-20): rota nomeada explicitamente `/api/test-flow-video` para evitar
+    colisão com `/api/test-video` (que é o endpoint legado de gerar vídeo de teste).
     """
     cookie = (req.get("cookie") or "").strip()
     if not cookie:
