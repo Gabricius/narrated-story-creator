@@ -13,6 +13,8 @@ services:
       - ./videos:/app/videos
       # Persistir banco de dados de vídeos
       - ./data:/app/data
+      # Compartilhar fontes do host com o container (para Arial Black, etc)
+      - /usr/share/fonts:/usr/share/fonts:ro
       # Opcional: montar assets customizados
       # - ./assets:/app/assets
     environment:
@@ -32,7 +34,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 40s
-
+      
 # Caso queira usar GPU NVIDIA (opcional)
 # Descomente as linhas abaixo e instale nvidia-docker2
 #    deploy:
