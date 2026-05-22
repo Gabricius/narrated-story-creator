@@ -1095,13 +1095,26 @@ def render_video(sound_path, subtitle_path, overlay_path, audio_length, bg_video
 
 def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_path,
                     audio_length, effect_paths=None, effect_layers_resolved=None,
-                    progress_callback=None):
+                    progress_callback=None,
+                    intro_video_paths=None, overlay_during_intro=True,
+                    subtitle_during_intro=True):
     """V4 video render: multiple background clips + optional particle effect layers.
 
     bg_paths:              List of local .mp4 paths used as background (concatenated and cycled).
     effect_layers_resolved: List of dicts: {local_path, opacity, blend_mode, label}.
                            Supported blend_mode values: colorkey_black, screen, chromakey_green, add.
     effect_paths:          Legacy fallback — list of local .mp4 paths (applied as screen blend).
+
+    intro_video_paths:     (2026-05-20 — Intro Cinematográfico IA) Lista opcional de paths
+                           de clips MP4 gerados pelo Flow (Veo 3.1) para servir como abertura
+                           do vídeo. São prepended à lista de bg (cobrem os primeiros segundos)
+                           e o TTS continua narrando desde t=0 normalmente.
+    overlay_during_intro:  Se False, o overlay do personagem (PNG bg-removed) só aparece
+                           após o término do intro (útil quando o personagem já está visível
+                           NO vídeo IA — evita duplicar).
+    subtitle_during_intro: Se False, a legenda karaoke fica oculta durante o intro. NOTA:
+                           feature ainda não implementada via filter_complex — fase 1.5.
+                           Hoje o subtitle continua visível independente desse flag (loga warn).
     """
     # Normalise to effect_layers_resolved (prefer new, fall back to legacy)
     if effect_layers_resolved is None and effect_paths:
@@ -1111,8 +1124,30 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
             for i, p in enumerate(effect_paths)
         ]
     effect_layers_resolved = effect_layers_resolved or []
+    intro_video_paths = intro_video_paths or []
     concat_list_path = None
     effect_concat_paths = []
+
+    # ── Pre-flight: calcular duração total do intro IA (se houver) ──
+    intro_total_duration_s = 0.0
+    for ip in intro_video_paths:
+        try:
+            probe_i = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", ip],
+                capture_output=True, text=True, timeout=10,
+            )
+            d = float(probe_i.stdout.strip()) if probe_i.returncode == 0 else 8.0
+        except Exception:
+            d = 8.0
+        intro_total_duration_s += max(d, 1.0)
+    if intro_video_paths:
+        print(f"[INTRO-V4] {len(intro_video_paths)} intro clip(s) totalling "
+              f"{intro_total_duration_s:.1f}s (overlay_during_intro={overlay_during_intro}, "
+              f"subtitle_during_intro={subtitle_during_intro})")
+        if not subtitle_during_intro:
+            print("[INTRO-V4] WARN: subtitle_during_intro=False not yet enforced — "
+                  "subtitle remains visible. Will be implemented in phase 1.5.")
 
     try:
         # ── 1. Build background concat list (all clips, cycled to cover audio_length) ──
@@ -1132,17 +1167,26 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
         if total_bg_dur <= 0:
             total_bg_dur = 30.0
 
-        cycles_needed = int(audio_length / total_bg_dur) + 2
+        # Os intros ocupam os primeiros N segundos; o bg precisa cobrir o restante.
+        bg_duration_needed = max(audio_length - intro_total_duration_s, 1.0)
+        cycles_needed = int(bg_duration_needed / total_bg_dur) + 2
         concat_list_path = os.path.join(os.path.dirname(output_path), "bg_v4_concat.txt")
 
         with open(concat_list_path, "w") as f:
+            # 2026-05-20: intros IA vêm PRIMEIRO (ordem preservada). Depois os clips de bg
+            # ciclam normalmente. concat demuxer aceita codec/resolução iguais (1920x1080 H.264);
+            # Veo 3.1 entrega exatamente esse formato, então não é necessário re-encode.
+            for ip in intro_video_paths:
+                safe_intro = os.path.abspath(ip).replace("'", "'\\''")
+                f.write(f"file '{safe_intro}'\n")
             for _ in range(cycles_needed):
                 for p in bg_paths:
                     safe = os.path.abspath(p).replace("'", "'\\''")
                     f.write(f"file '{safe}'\n")
 
         print(f"[BG-V4] {len(bg_paths)} clip(s) × {cycles_needed} cycles = "
-              f"{total_bg_dur * cycles_needed:.0f}s (need {audio_length:.0f}s)")
+              f"{total_bg_dur * cycles_needed:.0f}s + {intro_total_duration_s:.0f}s intro "
+              f"(need {audio_length:.0f}s)")
 
         # ── 2. Build FFmpeg inputs ──
         cmd = ["ffmpeg", "-y"]
@@ -1188,8 +1232,33 @@ def render_video_v4(bg_paths, overlay_path, sound_path, subtitle_path, output_pa
 
         # ── 3. Build filter_complex ──
         filter_parts = []
-        filter_parts.append("[0:v]scale=1920:1080,gblur=sigma=2[scaled]")
-        filter_parts.append("[scaled][1:v]overlay=format=auto[with_person]")
+        # 2026-05-22: Overlay REC durante a intro IA — esconde a marca d'água do VEO.
+        # Replica o padrão do Rede Z; enable='lt(t,N)' garante remoção exata ao
+        # término da intro, sem flag de configuração (sempre ativo quando há intro).
+        if intro_total_duration_s > 0:
+            DUR = f"{intro_total_duration_s:.2f}"
+            FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            # Aspas simples em volta da expressão isolam a vírgula do parser
+            # de filtros do FFmpeg — sem necessidade de backslash escape.
+            ENABLE = f"enable='lt(t,{DUR})'"
+            rec_chain = (
+                f",drawbox=x=iw-200:y=ih-90:w=180:h=70:color=black@1.0:t=fill:{ENABLE}"
+                f",drawtext=fontfile={FONT}:text='●':fontcolor=red:fontsize=44"
+                f":x=main_w-185:y=main_h-75:{ENABLE}"
+                f",drawtext=fontfile={FONT}:text='REC':fontcolor=white:fontsize=36"
+                f":x=main_w-130:y=main_h-71:{ENABLE}"
+            )
+        else:
+            rec_chain = ""
+        filter_parts.append(f"[0:v]scale=1920:1080,gblur=sigma=2{rec_chain}[scaled]")
+        # Overlay PNG do personagem: opcionalmente desabilitado durante o intro IA
+        # (quando a personagem já está visível no clip IA, evita "personagem dupla").
+        if intro_total_duration_s > 0 and not overlay_during_intro:
+            # `enable=` no overlay filter aceita expressão de tempo (em segundos)
+            overlay_enable = f":enable='gte(t,{intro_total_duration_s:.2f})'"
+        else:
+            overlay_enable = ""
+        filter_parts.append(f"[scaled][1:v]overlay=format=auto{overlay_enable}[with_person]")
 
         current_label = "with_person"
         for i, layer in enumerate(effect_layers_resolved):
