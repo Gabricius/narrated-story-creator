@@ -3544,9 +3544,14 @@ def _thumb_build_full_html(template: dict, formatted_context: str,
         if shapes_html else html
     )
 
-    # Detect and append auto-fit / multisize scripts to body content
+    # MANTENHA SINCRONIZADO com _buildThumbScripts() em pipeline-manager.html e
+    # const THUMB_SCRIPTS no Code node "Montar HTML HCTI" em n8n/JOB 5 - Monitor.json.
+    # Os 3 scripts (autofit + tokenizer per-linha _hil + multisize) precisam ser idênticos
+    # em todos os 4 pontos para que a thumb renderizada bata com o preview do editor.
+    # Sempre injeta os 3 — idempotência cobre o caso "DOM não tem o seletor" → no-op silencioso.
     js_scripts = ""
-    if "@autofit-base" in css or "@autofit-hook" in css or "[data-autofit]" in html:
+    # Autofit (busca binária 8–400)
+    if True:
         js_scripts += r"""
 <script>
 document.fonts.ready.then(function(){
@@ -3561,7 +3566,16 @@ document.fonts.ready.then(function(){
 });
 </script>
 """
-    if "@multisize-base" in css or "@multisize-hook" in css or "[data-multisize]" in html:
+    # Tokenizer per-linha (FIX-7 2026-05-21): tokeniza .hook-inline em palavras (_tmpw),
+    # agrupa por offsetTop em linhas, envolve cada linha em <span class="_hil"> com <br>.
+    # Idempotente via dataset.hilTok. Sem ele, o BG vermelho per-linha não renderiza.
+    js_scripts += r"""
+<script>
+document.fonts.ready.then(function(){setTimeout(function(){document.querySelectorAll(".hook-inline").forEach(function(hi){if(hi.dataset.hilTok==="1")return;var t=hi.textContent;if(!t||!t.trim()){hi.dataset.hilTok="1";return;}var parts=t.split(/(\s+)/);hi.innerHTML=parts.map(function(p){if(!p)return "";if(/^\s+$/.test(p))return p;var esc=p.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");return "<span class='_tmpw'>"+esc+"</span>";}).join("");var ws=hi.querySelectorAll("._tmpw");if(ws.length===0){hi.dataset.hilTok="1";return;}var lines=[];var cur=null;for(var i=0;i<ws.length;i++){var top=ws[i].offsetTop;if(!cur||Math.abs(cur.top-top)>2){cur={top:top,words:[]};lines.push(cur);}cur.words.push(ws[i].textContent);}hi.innerHTML=lines.map(function(line,idx){var content=line.words.join(" ").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");return (idx>0?"<br>":"")+"<span class='_hil'>"+content+"</span>";}).join("");hi.dataset.hilTok="1";});},0);});
+</script>
+"""
+    # Multisize (sempre injeta — no-op se DOM não tem [data-multisize])
+    if True:
         js_scripts += r"""
 <script>
 document.fonts.ready.then(function(){
