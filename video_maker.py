@@ -14,6 +14,7 @@ CUDA = os.environ.get('CUDA', '0') == '1'
 # ── Subtitle layout constants ──
 SUBTITLE_POS_Y_V2 = int(1080 * 0.675)   # 729px — vertical center of v2 karaoke text
 SUBTITLE_STRIP_TOP = 0.75               # fraction — subtitle strip starts at 75% height (v3/v4)
+CHARACTER_SCALE_FACTOR = 0.8            # v4 — encolhe o personagem para dar respiro acima (base permanece ancorada em strip_y)
 
 # ── V4 Subtitle Color Presets ──
 # ASS color format: &HAABBGGRR (alpha, blue, green, red — hex)
@@ -271,7 +272,7 @@ def create_overlay_v4(
 
     # Scale character to fill available height above strip
     max_char_height = strip_y
-    char_height = min(orig_h, max_char_height)
+    char_height = int(min(orig_h, max_char_height) * CHARACTER_SCALE_FACTOR)
     char_width = int(char_height * orig_w / orig_h)
 
     person_img_resized = person_img.resize((char_width, char_height), Image.LANCZOS)
