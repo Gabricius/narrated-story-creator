@@ -3467,6 +3467,84 @@ def _thumb_serialize_shapes(shapes) -> str:
     return "".join(out)
 
 
+def _thumb_inject_layer_css(css: str, layers: list) -> str:
+    """Templates salvos com geradores antigos podem não ter as regras
+    `.layer_X { position/z-index/background-image/... }` no global_css.
+    Sem essas regras, a imagem e shape-divs do html_template ficam invisíveis
+    e o `shapes_html` duplicado (gerado de template.shapes) acaba sobrepondo
+    com z-indices errados.
+
+    Esta função regera as regras a partir de `template.layers`, espelhando
+    a lógica de `tplConvertLayersToCode()` em pipeline-manager.html. Só anexa
+    quando a regra `.layer_X { ... }` não existe no CSS (não destrói edits
+    manuais)."""
+    if not layers:
+        return css
+    import re
+    out_rules = []
+    for idx, layer in enumerate(layers):
+        if not layer:
+            continue
+        raw_id = layer.get("id") or ""
+        sid = re.sub(r'[^a-zA-Z0-9_-]', '_', raw_id)
+        if not sid:
+            continue
+        # Skip se a regra já existe (não sobrescreve)
+        if re.search(r'\.' + re.escape(sid) + r'\s*\{', css):
+            continue
+        x = layer.get("x", 0)
+        y = layer.get("y", 0)
+        w = layer.get("w", 0)
+        h = layer.get("h", 0)
+        z = idx * 2
+        layer_type = layer.get("type")
+        slot = layer.get("slot")
+        if layer_type == "shape":
+            grad = layer.get("gradient") or {}
+            if grad.get("enabled") and isinstance(grad.get("stops"), list) and len(grad["stops"]) >= 2:
+                stops = []
+                for st in grad["stops"]:
+                    op = st.get("opacity", 1)
+                    pos = st.get("position", 0)
+                    stops.append(f"{_thumb_hex_to_rgba(st.get('color', '#000000'), op)} {pos}%")
+                angle = grad.get("angle", 90)
+                bg = f"linear-gradient({angle}deg, {', '.join(stops)})"
+            else:
+                bg = _thumb_hex_to_rgba(layer.get("fillColor", "#000000"), layer.get("fillOpacity", 1))
+            shape_type = layer.get("shapeType", "rect")
+            border_radius = ("50%" if shape_type == "circle" else f"{layer.get('borderRadius', 0)}px")
+            rotation = layer.get("rotation", 0)
+            transform = f" transform: rotate({rotation}deg);" if rotation else ""
+            rule = (
+                f".{sid} {{ position: absolute; z-index: {z}; "
+                f"left: {x}px; top: {y}px; width: {w}px; height: {h}px; "
+                f"background: {bg}; "
+                f"border: {layer.get('borderWidth', 0)}px solid {layer.get('borderColor', 'transparent')}; "
+                f"border-radius: {border_radius}; pointer-events: none; box-sizing: border-box;{transform} }}"
+            )
+        elif slot == "background_image" or layer_type == "image":
+            # `{{background_image}}` permanece como placeholder — substituição é feita depois.
+            rule = (
+                f".{sid} {{ position: absolute; z-index: {z}; "
+                f"left: {x}px; top: {y}px; width: {w}px; height: {h}px; "
+                f"background-image: url('{{{{background_image}}}}'); "
+                f"background-size: cover; background-position: 68% center; }}"
+            )
+        else:
+            # Layer de texto (hook / formatted_context / label)
+            va = layer.get("verticalAlign", "top")
+            fj = "center" if va == "center" else "flex-end" if va == "bottom" else "flex-start"
+            rule = (
+                f".{sid} {{ position: absolute; z-index: {z}; "
+                f"left: {x}px; top: {y}px; width: {w}px; height: {h}px; "
+                f"display: flex; flex-direction: column; justify-content: {fj}; overflow: visible; }}"
+            )
+        out_rules.append(rule)
+    if out_rules:
+        css = css.rstrip() + "\n\n/* === Auto-injected layer CSS (template missing .layer_X rules) === */\n" + "\n".join(out_rules) + "\n"
+    return css
+
+
 def _thumb_build_full_html(template: dict, formatted_context: str,
                            hook: str, background_image_url: str) -> str:
     """Replicates exactly the JOB 5 "Montar HTML HCTI" node so manual renders
@@ -3485,7 +3563,12 @@ def _thumb_build_full_html(template: dict, formatted_context: str,
     import re
     # Strip any old script tags from html template so they can be replaced by updated ones
     html = re.sub(r'<script\b[^>]*>([\s\S]*?)<\/script>', '', html)
-    css = global_css.replace("{{background_image}}", background_image_url or "")
+    # Auto-injeta regras `.layer_X { position/z-index/background-image/... }` se faltarem.
+    # Templates antigos podem ter sido salvos sem essas regras, e sem elas a imagem e os
+    # shape-divs do html_template ficam invisíveis (apenas shapes_html aparece, com z-indices
+    # errados → imagem aparenta cobrir shapes). Aplica-se ANTES do replace de placeholder.
+    css = _thumb_inject_layer_css(global_css, template.get("layers") or [])
+    css = css.replace("{{background_image}}", background_image_url or "")
 
     # Auto-inject Google Fonts if not imported (handles Oswald, Bebas Neue, Archivo Black, and Anton)
     if "@import" not in css and "fonts.googleapis.com" not in css:
