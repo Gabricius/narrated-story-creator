@@ -1930,6 +1930,43 @@ def remove_background_poof(image_path: str, poof_api_key: str) -> str:
     return out_path
 
 
+@app.post("/api/remove-bg")
+async def remove_bg(request: Request):
+    """Remove background via POOF; returns a cropped transparent PNG (image/png).
+
+    Body: raw image bytes — send with:
+        curl -s -X POST --data-binary @char.png http://<host>/api/remove-bg -o char_nobg.png
+    Used by the Rede Z "Drone V2.2" editor to cut out the character before compositing.
+    The poof_api_key stays server-side (read from system_config); callers never need it.
+    """
+    import tempfile
+    poof_key = get_system_config("poof_api_key")
+    if not poof_key:
+        return JSONResponse({"error": "poof_api_key not found in system_config"}, status_code=500)
+    body = await request.body()
+    if not body:
+        return JSONResponse({"error": "empty body — send raw image bytes (--data-binary @file)"}, status_code=400)
+
+    tmp_dir = tempfile.mkdtemp(prefix="removebg_")
+    in_path = os.path.join(tmp_dir, "input")
+    try:
+        with open(in_path, "wb") as fh:
+            fh.write(body)
+        out_path = remove_background_poof(in_path, poof_key)
+        return FileResponse(out_path, media_type="image/png",
+                            filename="character_nobg.png", background=None)
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        print(f"[remove-bg] error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=502)
+    finally:
+        # Cleanup the temp dir shortly after the response is streamed.
+        async def _cleanup():
+            await asyncio.sleep(10)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        asyncio.create_task(_cleanup())
+
+
 def select_bg_videos(folder_ids: list, max_clips: int, video_dir: str) -> list:
     """Pick random folder, list .mp4s via rclone, download up to max_clips.
 
