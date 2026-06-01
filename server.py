@@ -3793,6 +3793,88 @@ async def thumb_make(req: dict):
     )
 
 
+def safe_filename(name: str) -> str | None:
+    """Sanitize the output filename to be safe for filesystem and url, ending with .png."""
+    if not name or not isinstance(name, str):
+        return None
+    cleaned = re.sub(r'[^a-zA-Z0-9._-]', '_', name)[:200]
+    return cleaned if cleaned.lower().endswith('.png') else cleaned + '.png'
+
+
+def _thumb_supabase_upload(url: str, key: str, bucket: str, png_bytes: bytes, filename: str) -> str:
+    """Uploads PNG bytes to Supabase storage and returns the public URL."""
+    base = url.rstrip("/")
+    target = f"{base}/storage/v1/object/{bucket}/{filename}"
+    r = requests.post(
+        target,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "apikey": key,
+            "Content-Type": "image/png",
+            "x-upsert": "true",
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+        data=png_bytes,
+        timeout=30,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Supabase upload failed {r.status_code}: {r.text[:300]}")
+    return f"{base}/storage/v1/object/public/{bucket}/{filename}"
+
+
+@app.post("/render")
+@app.post("/api/render")
+async def render_endpoint(req: dict):
+    """Replicates Node.js thumb-renderer POST /render endpoint.
+    Renders an HTML document to PNG using internal Playwright, uploads to Supabase,
+    and returns the public URL.
+    """
+    html = req.get("html") or ""
+    viewport_width = int(req.get("viewport_width") or 1280)
+    viewport_height = int(req.get("viewport_height") or 720)
+    ms_delay = int(req.get("ms_delay") or 500)
+    filename = req.get("filename") or ""
+    supabase_url = req.get("supabase_url") or ""
+    supabase_key = req.get("supabase_key") or ""
+    supabase_bucket = req.get("supabase_bucket") or "thumbnails"
+
+    if not html:
+        return JSONResponse(content={"error": "html (string) required"}, status_code=400)
+    if not supabase_url or not supabase_key:
+        return JSONResponse(content={"error": "supabase_url and supabase_key required in body"}, status_code=400)
+
+    # Sanitize/resolve filename
+    final_name = safe_filename(filename)
+    if not final_name:
+        import uuid
+        import time
+        final_name = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}.png"
+
+    # Render HTML to PNG
+    try:
+        png_bytes = await _render_html_to_png(
+            html,
+            width=viewport_width,
+            height=viewport_height,
+            ms_delay=ms_delay
+        )
+    except Exception as e:
+        return JSONResponse(content={"error": f"render failed: {e}"}, status_code=500)
+
+    # Upload to Supabase Storage
+    try:
+        public_url = _thumb_supabase_upload(
+            supabase_url,
+            supabase_key,
+            supabase_bucket,
+            png_bytes,
+            final_name
+        )
+        return {"url": public_url, "filename": final_name}
+    except Exception as e:
+        return JSONResponse(content={"error": f"upload failed: {e}"}, status_code=502)
+
+
 sse = SseServerTransport("/mcp/messages/")
 app.router.routes.append(Mount("/mcp/messages", app=sse.handle_post_message))
 
