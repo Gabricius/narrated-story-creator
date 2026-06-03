@@ -2450,6 +2450,7 @@ def _flow_call_single(
     aspect_ratio: str,
     prompt: str,
     seed: int,
+    image_inputs: list | None = None,
 ) -> dict:
     """Faz uma chamada flowMedia:batchGenerateImages para gerar 1 imagem.
 
@@ -2477,7 +2478,7 @@ def _flow_call_single(
                 "imageAspectRatio": aspect_ratio,
                 "structuredPrompt": {"parts": [{"text": prompt}]},
                 "seed": seed,
-                "imageInputs": [],
+                "imageInputs": image_inputs or [],
             }
         ],
     }
@@ -2653,6 +2654,31 @@ def generate_flow(req: dict):
     batch_id = str(uuid.uuid4())
     session_id = f";{int(time.time() * 1000)}"
 
+    # ---- Imagens de referência (image-to-image), opcional ----
+    # req.reference_images: lista de strings base64 (data URL "data:...;base64,XXX" ou base64 cru).
+    # Quando vazio, imageInputs fica [] e o comportamento é idêntico ao anterior (RA não muda).
+    # ATENÇÃO: o schema do imageInputs do Flow NÃO está documentado aqui — esta estrutura
+    # (`{"image": {"encodedImage": b64}}`) é um PALPITE e precisa ser validada num teste real.
+    # Se o Flow exigir mediaId, será necessário primeiro fazer upload da imagem ao Flow e usar o id.
+    image_inputs: list = []
+    for ri in (req.get("reference_images") or []):
+        if isinstance(ri, dict):
+            ri = ri.get("url") or ri.get("base64") or ""
+        ri = (ri or "").strip()
+        if not ri:
+            continue
+        try:
+            if ri.startswith("http"):
+                rr = requests.get(ri, timeout=20)
+                rr.raise_for_status()
+                b64 = base64.b64encode(rr.content).decode("ascii")
+            else:
+                b64 = ri.split(",", 1)[1] if ri.startswith("data:") else ri
+        except Exception as e:
+            print(f"[Flow] reference image skip ({ri[:60]}): {e}")
+            continue
+        image_inputs.append({"image": {"encodedImage": b64}})
+
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
         return _flow_call_single(
@@ -2665,6 +2691,7 @@ def generate_flow(req: dict):
             aspect_ratio=ar_value,
             prompt=prompt,
             seed=random.randint(1, 2 ** 31),
+            image_inputs=image_inputs,
         )
 
     results: list[dict] = []
