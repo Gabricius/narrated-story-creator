@@ -2439,6 +2439,71 @@ def flow_get_token(cookie: str) -> dict:
     return data
 
 
+FLOW_UPLOAD_URL = "https://aisandbox-pa.googleapis.com/v1/flow/uploadImage"
+
+
+def _flow_upload_reference(*, access_token: str, project_id: str, src: str) -> str | None:
+    """Faz upload de uma imagem de referência (URL http(s) ou data URL) ao Flow e
+    retorna o mediaId ('name') para uso em imageInputs.
+
+    Schema REAL capturado do labs.google (POST text/plain com corpo JSON):
+      POST https://aisandbox-pa.googleapis.com/v1/flow/uploadImage
+      body = {"clientContext":{"projectId":..,"tool":"PINHOLE"},
+              "imageBytes": <base64 SEM prefixo data:>,
+              "isUserUploaded": true, "isHidden": false,
+              "mimeType": "image/png", "fileName": "ref.png"}
+      resp = {"media": {"name": "<mediaId>", ...}}  → media.name é o id p/ imageInputs.
+
+    Resolve src (data URL ou http) → bytes; faz upload; devolve media.name.
+    Em qualquer falha retorna None (caller pula a referência sem quebrar a geração).
+    """
+    try:
+        # 1) resolver bytes + mimeType
+        if src.startswith("data:"):
+            head, _, b64 = src.partition(",")
+            mime = "image/png"
+            if head.startswith("data:") and ";" in head:
+                mime = head[len("data:"):head.index(";")] or mime
+            raw = base64.b64decode(b64)
+        elif src.startswith("http"):
+            r = requests.get(src, timeout=60)
+            if r.status_code != 200 or not r.content:
+                print(f"[Flow upload] download falhou ({r.status_code}): {src[:80]}")
+                return None
+            raw = r.content
+            mime = r.headers.get("Content-Type", "image/png").split(";")[0].strip() or "image/png"
+        else:
+            return None
+
+        if not raw:
+            return None
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp"}.get(mime, "png")
+        payload = {
+            "clientContext": {"projectId": project_id, "tool": "PINHOLE"},
+            "imageBytes": base64.b64encode(raw).decode("ascii"),
+            "isUserUploaded": True,
+            "isHidden": False,
+            "mimeType": mime,
+            "fileName": f"ref_reference.{ext}",
+        }
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "text/plain;charset=UTF-8",
+        }
+        # IMPORTANTE: enviar como text/plain (data=), não json= (que forçaria application/json)
+        resp = requests.post(FLOW_UPLOAD_URL, data=json.dumps(payload), headers=headers, timeout=90)
+        if resp.status_code != 200:
+            print(f"[Flow upload] HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        name = (resp.json().get("media") or {}).get("name")
+        if name:
+            print(f"[Flow upload] ref → mediaId {name}")
+        return name or None
+    except Exception as e:
+        print(f"[Flow upload] erro: {e}")
+        return None
+
+
 def _flow_call_single(
     *,
     project_id: str,
@@ -2467,27 +2532,33 @@ def _flow_call_single(
         "tool": "PINHOLE",
         "sessionId": session_id,
     }
-    payload = {
-        "clientContext": client_context,
-        "mediaGenerationContext": {"batchId": batch_id},
-        "useNewMedia": True,
-        "requests": [
-            {
-                "clientContext": client_context,
-                "imageModelName": model_name,
-                "imageAspectRatio": aspect_ratio,
-                "structuredPrompt": {"parts": [{"text": prompt}]},
-                "seed": seed,
-                "imageInputs": image_inputs or [],
-            }
-        ],
-    }
+    def _build_payload(inputs):
+        return {
+            "clientContext": client_context,
+            "mediaGenerationContext": {"batchId": batch_id},
+            "useNewMedia": True,
+            "requests": [
+                {
+                    "clientContext": client_context,
+                    "imageModelName": model_name,
+                    "imageAspectRatio": aspect_ratio,
+                    "structuredPrompt": {"parts": [{"text": prompt}]},
+                    "seed": seed,
+                    "imageInputs": inputs or [],
+                }
+            ],
+        }
     headers = {
         **FLOW_DEFAULT_HEADERS,
         "Authorization": f"Bearer {access_token}",
     }
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=90)
+        resp = requests.post(url, json=_build_payload(image_inputs), headers=headers, timeout=90)
+        # Best-effort: se o schema de imageInputs for rejeitado (campo desconhecido),
+        # refaz SEM as imagens de referência para não bloquear a geração base.
+        if resp.status_code == 400 and image_inputs and "image_inputs" in (resp.text or ""):
+            print("[Flow] imageInputs rejeitado pelo schema do Flow — refazendo sem reference_images")
+            resp = requests.post(url, json=_build_payload([]), headers=headers, timeout=90)
     except requests.exceptions.Timeout:
         return {"ok": False, "error": "timeout (90s)"}
     except Exception as e:
@@ -2660,24 +2731,29 @@ def generate_flow(req: dict):
     # ATENÇÃO: o schema do imageInputs do Flow NÃO está documentado aqui — esta estrutura
     # (`{"image": {"encodedImage": b64}}`) é um PALPITE e precisa ser validada num teste real.
     # Se o Flow exigir mediaId, será necessário primeiro fazer upload da imagem ao Flow e usar o id.
+    # Schema REAL do Flow (capturado do labs.google):
+    #   imageInputs[i] = {"imageInputType":"IMAGE_INPUT_TYPE_REFERENCE", "name": <mediaId>}
+    # O <mediaId> ("name") NÃO é base64 — vem de fazer UPLOAD da imagem ao Flow primeiro.
+    # modo: "all" (manda todas) | "random1" (sorteia 1) — para A/B testar.
+    ref_list = list(req.get("reference_images") or [])
+    if (req.get("reference_mode") or "all").strip().lower() == "random1" and len(ref_list) > 1:
+        ref_list = [random.choice(ref_list)]
     image_inputs: list = []
-    for ri in (req.get("reference_images") or []):
+    for ri in ref_list:
         if isinstance(ri, dict):
-            ri = ri.get("url") or ri.get("base64") or ""
+            ri = ri.get("name") or ri.get("media_id") or ri.get("url") or ri.get("base64") or ""
         ri = (ri or "").strip()
         if not ri:
             continue
-        try:
-            if ri.startswith("http"):
-                rr = requests.get(ri, timeout=20)
-                rr.raise_for_status()
-                b64 = base64.b64encode(rr.content).decode("ascii")
-            else:
-                b64 = ri.split(",", 1)[1] if ri.startswith("data:") else ri
-        except Exception as e:
-            print(f"[Flow] reference image skip ({ri[:60]}): {e}")
-            continue
-        image_inputs.append({"image": {"encodedImage": b64}})
+        if ri.startswith("http") or ri.startswith("data:"):
+            # precisa virar mediaId via upload ao Flow
+            media_name = _flow_upload_reference(access_token=access_token, project_id=project_id, src=ri)
+            if not media_name:
+                print(f"[Flow] sem upload de referência disponível, pulando: {ri[:60]}")
+                continue
+        else:
+            media_name = ri  # já é um mediaId/name do Flow
+        image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
 
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
