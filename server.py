@@ -2672,8 +2672,13 @@ def generate_flow(req: dict):
       model: "nano_banana_2" (default) | "nano_banana_pro"
       project_id: opcional override (senão lê system_config.flow_project_id)
     """
-    cookie = (req.get("cookie") or "").replace("\r", "").replace("\n", " ").strip()
-    cookie = re.sub(r"\s+", " ", cookie)
+    cookie = (req.get("cookie") or "").strip()
+    # Fallback: se body não trouxer cookie, lê system_config.flow_cookie (que a flow-token-extension
+    # mantém sempre atualizado via /api/flow-cookie-set + cache invalidation). Isso permite que o
+    # caller (n8n) NÃO precise capturar o cookie estaticamente — cada call usa o cookie mais novo.
+    if not cookie:
+        cookie = get_system_config("flow_cookie") or ""
+    cookie = re.sub(r"\s+", " ", cookie.replace("\r", "").replace("\n", " ")).strip()
     prompt = (req.get("prompt") or "").strip()
     aspect_ratio_raw = (req.get("aspect_ratio") or "16:9").strip()
     num_images = int(req.get("num_images") or 4)
@@ -2681,7 +2686,7 @@ def generate_flow(req: dict):
     project_id = (req.get("project_id") or "").strip() or _flow_get_project_id()
 
     if not cookie:
-        return JSONResponse(content={"error": "Cookie de sessão é obrigatório"}, status_code=400)
+        return JSONResponse(content={"error": "Cookie de sessão indisponível (nem no body nem em system_config.flow_cookie). Garanta que a flow-token-extension está rodando."}, status_code=400)
     if not prompt:
         return JSONResponse(content={"error": "Prompt é obrigatório"}, status_code=400)
 
