@@ -2554,11 +2554,16 @@ def _flow_call_single(
     }
     try:
         resp = requests.post(url, json=_build_payload(image_inputs), headers=headers, timeout=90)
-        # Best-effort: se o schema de imageInputs for rejeitado (campo desconhecido),
-        # refaz SEM as imagens de referência para não bloquear a geração base.
-        if resp.status_code == 400 and image_inputs and "image_inputs" in (resp.text or ""):
-            print("[Flow] imageInputs rejeitado pelo schema do Flow — refazendo sem reference_images")
-            resp = requests.post(url, json=_build_payload([]), headers=headers, timeout=90)
+        # Se o schema do Flow rejeitar imageInputs (400) E o usuário NÃO tinha passado refs,
+        # refaz sem refs (defensivo). Se o usuário PASSOU refs (intenção explícita), NÃO silencia
+        # — devolve erro com a body do Flow p/ que a página mostre claramente.
+        if resp.status_code == 400 and "image_inputs" in (resp.text or ""):
+            if not image_inputs:
+                resp = requests.post(url, json=_build_payload([]), headers=headers, timeout=90)
+            else:
+                return {"ok": False, "status_code": 400,
+                        "error": "Flow rejeitou imageInputs (refs ativas). Body: " + (resp.text or "")[:400],
+                        "image_inputs_rejected": True}
     except requests.exceptions.Timeout:
         return {"ok": False, "error": "timeout (90s)"}
     except Exception as e:
