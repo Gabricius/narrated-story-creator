@@ -2682,10 +2682,8 @@ def generate_flow(req: dict):
     prompt = (req.get("prompt") or "").strip()
     aspect_ratio_raw = (req.get("aspect_ratio") or "16:9").strip()
     num_images = int(req.get("num_images") or 4)
-    # 2026-06-05: default mudou p/ "nano_banana_pro" (GEM_PIX_2) — o NARWHAL (nano_banana_2)
-    # vinha esbarrando em quota diária per-model + não aceita imageInputs. Pro funciona em
-    # ambos os modos (com e sem refs).
-    model_raw = (req.get("model") or "nano_banana_pro").strip().lower()
+    # 2026-06-06: default voltou para nano_banana_2 (NARWHAL) — funciona com imageInputs de mediaId.
+    model_raw = (req.get("model") or "nano_banana_2").strip().lower()
     project_id = (req.get("project_id") or "").strip() or _flow_get_project_id()
 
     if not cookie:
@@ -2791,16 +2789,21 @@ def generate_flow(req: dict):
         image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
     references_requested = len([r for r in ref_list_raw if r])
     references_uploaded  = len(image_inputs)
-    print(f"[Flow] refs requested={references_requested} uploaded={references_uploaded} failed={len(ref_failures)}")
-
-    # 🔬 Importante (2026-06-05, capturado de curl real): imageInputs só funciona com GEM_PIX_2
-    # (= nano_banana_pro). NARWHAL (= nano_banana_2) recebido com imageInputs devolve 500 INTERNAL
-    # silencioso. Auto-promover quando há refs evita esse erro e mantém compat (sem refs continua
-    # respeitando o model do request).
-    if image_inputs and model_name == "NARWHAL":
-        print(f"[Flow] refs presentes (n={len(image_inputs)}) → forçando model GEM_PIX_2 (nano_banana_pro). NARWHAL não suporta imageInputs.")
+    # 2026-06-06: NARWHAL (nano_banana_2) SUPORTA imageInputs com mediaIds pré-existentes.
+    # Confirmado via curl real: imageModelName=NARWHAL + imageInputs[name=uuid] funciona.
+    # A restrição anterior (promover para GEM_PIX_2) era para uploads de bytes (data:/http),
+    # não para mediaIds já registrados no Flow. Como agora todas as refs são mediaIds,
+    # a promoção automática foi removida — o modelo solicitado é respeitado.
+    # Mantemos a promoção apenas se houver refs que precisaram de upload (data: ou http).
+    _has_uploaded_refs = any(
+        (ri if isinstance(ri, str) else (ri.get("url") or ri.get("base64") or "")).startswith(("http", "data:"))
+        for ri in ref_list_raw if ri
+    )
+    if image_inputs and model_name == "NARWHAL" and _has_uploaded_refs:
+        print(f"[Flow] refs com upload de bytes (n={len(image_inputs)}) → forçando GEM_PIX_2 (nano_banana_pro). NARWHAL não suporta imageInputs com bytes.")
         model_name = "GEM_PIX_2"
         model_raw = "nano_banana_pro"
+    print(f"[Flow] refs requested={references_requested} applied={references_uploaded} failed={len(ref_failures)} model_used={model_raw}")
 
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
