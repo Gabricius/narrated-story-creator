@@ -2739,16 +2739,26 @@ def generate_flow(req: dict):
     session_id = f";{int(time.time() * 1000)}"
 
     # ---- Imagens de referência (image-to-image), opcional ----
-    # req.reference_images: lista de strings base64 (data URL "data:...;base64,XXX" ou base64 cru).
+    # req.reference_images: aceita múltiplos formatos:
+    #   - dict {media_id: "uuid"} → usa o mediaId direto (NOVO padrão a partir de 2026-06-06)
+    #   - dict {name: "uuid"} → idem
+    #   - string UUID bare → trata como mediaId diretamente (sem upload)
+    #   - string data URL "data:..." → faz upload ao Flow, obtém mediaId
+    #   - string URL http(s) → baixa + faz upload ao Flow, obtém mediaId
+    #   - string URL labs.google .../edit/<uuid> → extrai mediaId sem upload
+    # O pipeline-manager salva as refs como [{preview_url, media_id, label}] no system_config.
     # Quando vazio, imageInputs fica [] e o comportamento é idêntico ao anterior (RA não muda).
-    # ATENÇÃO: o schema do imageInputs do Flow NÃO está documentado aqui — esta estrutura
-    # (`{"image": {"encodedImage": b64}}`) é um PALPITE e precisa ser validada num teste real.
-    # Se o Flow exigir mediaId, será necessário primeiro fazer upload da imagem ao Flow e usar o id.
-    # Schema REAL do Flow (capturado do labs.google):
+    # Schema REAL do Flow (capturado de curl real em 2026-06-06):
     #   imageInputs[i] = {"imageInputType":"IMAGE_INPUT_TYPE_REFERENCE", "name": <mediaId>}
-    # O <mediaId> ("name") NÃO é base64 — vem de fazer UPLOAD da imagem ao Flow primeiro.
     # modo: "all" (manda todas) | "random1" (sorteia 1) — para A/B testar.
-    ref_list_raw = list(req.get("reference_images") or [])
+    ref_imgs_raw = req.get("reference_images") or []
+    # Se vier como string JSON (n8n passa system_config.value sem JSON.parse), desserializar.
+    if isinstance(ref_imgs_raw, str):
+        try:
+            ref_imgs_raw = json.loads(ref_imgs_raw)
+        except Exception:
+            ref_imgs_raw = []
+    ref_list_raw = list(ref_imgs_raw) if isinstance(ref_imgs_raw, (list, tuple)) else []
     if (req.get("reference_mode") or "all").strip().lower() == "random1" and len(ref_list_raw) > 1:
         ref_list_raw = [random.choice(ref_list_raw)]
     image_inputs: list = []
