@@ -2745,25 +2745,29 @@ def generate_flow(req: dict):
     #   imageInputs[i] = {"imageInputType":"IMAGE_INPUT_TYPE_REFERENCE", "name": <mediaId>}
     # O <mediaId> ("name") NÃO é base64 — vem de fazer UPLOAD da imagem ao Flow primeiro.
     # modo: "all" (manda todas) | "random1" (sorteia 1) — para A/B testar.
-    ref_list = list(req.get("reference_images") or [])
-    if (req.get("reference_mode") or "all").strip().lower() == "random1" and len(ref_list) > 1:
-        ref_list = [random.choice(ref_list)]
+    ref_list_raw = list(req.get("reference_images") or [])
+    if (req.get("reference_mode") or "all").strip().lower() == "random1" and len(ref_list_raw) > 1:
+        ref_list_raw = [random.choice(ref_list_raw)]
     image_inputs: list = []
-    for ri in ref_list:
+    ref_failures: list = []  # [{src, error}]
+    for ri in ref_list_raw:
         if isinstance(ri, dict):
             ri = ri.get("name") or ri.get("media_id") or ri.get("url") or ri.get("base64") or ""
         ri = (ri or "").strip()
         if not ri:
             continue
         if ri.startswith("http") or ri.startswith("data:"):
-            # precisa virar mediaId via upload ao Flow
             media_name = _flow_upload_reference(access_token=access_token, project_id=project_id, src=ri)
             if not media_name:
-                print(f"[Flow] sem upload de referência disponível, pulando: {ri[:60]}")
+                ref_failures.append({"src": ri[:120], "error": "upload ao Flow falhou (cookie pode estar expirado / 4xx)"})
+                print(f"[Flow] ref upload FALHOU, pulando: {ri[:80]}")
                 continue
         else:
             media_name = ri  # já é um mediaId/name do Flow
         image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
+    references_requested = len([r for r in ref_list_raw if r])
+    references_uploaded  = len(image_inputs)
+    print(f"[Flow] refs requested={references_requested} uploaded={references_uploaded} failed={len(ref_failures)}")
 
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
@@ -2873,6 +2877,10 @@ def generate_flow(req: dict):
         # `reference_media_id` no submit de vídeo (mantém personagem consistente).
         "media_id": primary.get("media_id"),
         "all_media_ids": [s.get("media_id") for s in saved_images],
+        # 2026-06-05: visibilidade do upload de referências p/ a UI saber se estilo foi aplicado.
+        "references_requested": references_requested,
+        "references_uploaded": references_uploaded,
+        "references_failures": ref_failures,
     }
 
 
