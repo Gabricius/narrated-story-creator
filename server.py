@@ -2780,6 +2780,15 @@ def generate_flow(req: dict):
     references_uploaded  = len(image_inputs)
     print(f"[Flow] refs requested={references_requested} uploaded={references_uploaded} failed={len(ref_failures)}")
 
+    # 🔬 Importante (2026-06-05, capturado de curl real): imageInputs só funciona com GEM_PIX_2
+    # (= nano_banana_pro). NARWHAL (= nano_banana_2) recebido com imageInputs devolve 500 INTERNAL
+    # silencioso. Auto-promover quando há refs evita esse erro e mantém compat (sem refs continua
+    # respeitando o model do request).
+    if image_inputs and model_name == "NARWHAL":
+        print(f"[Flow] refs presentes (n={len(image_inputs)}) → forçando model GEM_PIX_2 (nano_banana_pro). NARWHAL não suporta imageInputs.")
+        model_name = "GEM_PIX_2"
+        model_raw = "nano_banana_pro"
+
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
         return _flow_call_single(
