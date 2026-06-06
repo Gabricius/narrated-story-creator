@@ -2682,7 +2682,10 @@ def generate_flow(req: dict):
     prompt = (req.get("prompt") or "").strip()
     aspect_ratio_raw = (req.get("aspect_ratio") or "16:9").strip()
     num_images = int(req.get("num_images") or 4)
-    model_raw = (req.get("model") or "nano_banana_2").strip().lower()
+    # 2026-06-05: default mudou p/ "nano_banana_pro" (GEM_PIX_2) — o NARWHAL (nano_banana_2)
+    # vinha esbarrando em quota diária per-model + não aceita imageInputs. Pro funciona em
+    # ambos os modos (com e sem refs).
+    model_raw = (req.get("model") or "nano_banana_pro").strip().lower()
     project_id = (req.get("project_id") or "").strip() or _flow_get_project_id()
 
     if not cookie:
