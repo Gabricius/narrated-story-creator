@@ -2756,9 +2756,15 @@ def generate_flow(req: dict):
             ref_imgs_raw = json.loads(ref_imgs_raw)
         except Exception:
             ref_imgs_raw = []
-    ref_list_raw = list(ref_imgs_raw) if isinstance(ref_imgs_raw, (list, tuple)) else []
-    if (req.get("reference_mode") or "all").strip().lower() == "random1" and len(ref_list_raw) > 1:
+    ref_mode = (req.get("reference_mode") or "all").strip().lower()
+    if ref_mode == "random1" and len(ref_list_raw) > 1:
         ref_list_raw = [random.choice(ref_list_raw)]
+    elif ref_mode == "specific":
+        specific_items = [ri for ri in ref_list_raw if isinstance(ri, dict) and (ri.get("active") is True or ri.get("selected") is True)]
+        if specific_items:
+            ref_list_raw = [specific_items[0]]
+        elif ref_list_raw:
+            ref_list_raw = [ref_list_raw[0]]
     image_inputs: list = []
     ref_failures: list = []  # [{src, error}]
     # Regex p/ extrair mediaId direto de URLs labs.google do Flow (form: .../edit/<UUID>)
