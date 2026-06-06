@@ -2750,20 +2750,31 @@ def generate_flow(req: dict):
         ref_list_raw = [random.choice(ref_list_raw)]
     image_inputs: list = []
     ref_failures: list = []  # [{src, error}]
+    # Regex p/ extrair mediaId direto de URLs labs.google do Flow (form: .../edit/<UUID>)
+    _LABS_EDIT_RE = re.compile(r"labs\.google/.*?/edit/([0-9a-fA-F-]{20,})")
+    _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
     for ri in ref_list_raw:
         if isinstance(ri, dict):
             ri = ri.get("name") or ri.get("media_id") or ri.get("url") or ri.get("base64") or ""
         ri = (ri or "").strip()
         if not ri:
             continue
-        if ri.startswith("http") or ri.startswith("data:"):
+        # Atalho: URL labs.google do Flow → extrai mediaId, sem upload (evita 401 no upload)
+        m = _LABS_EDIT_RE.search(ri)
+        if m:
+            media_name = m.group(1)
+            print(f"[Flow] ref labs.google URL → mediaId {media_name} (sem upload)")
+        elif _UUID_RE.match(ri):
+            media_name = ri  # bare UUID = mediaId pronto
+            print(f"[Flow] ref bare mediaId → {media_name}")
+        elif ri.startswith("http") or ri.startswith("data:"):
             media_name = _flow_upload_reference(access_token=access_token, project_id=project_id, src=ri)
             if not media_name:
                 ref_failures.append({"src": ri[:120], "error": "upload ao Flow falhou (cookie pode estar expirado / 4xx)"})
                 print(f"[Flow] ref upload FALHOU, pulando: {ri[:80]}")
                 continue
         else:
-            media_name = ri  # já é um mediaId/name do Flow
+            media_name = ri  # qualquer outro: trata como mediaId/name do Flow
         image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
     references_requested = len([r for r in ref_list_raw if r])
     references_uploaded  = len(image_inputs)
