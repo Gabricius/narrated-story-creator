@@ -2756,6 +2756,7 @@ def generate_flow(req: dict):
             ref_imgs_raw = json.loads(ref_imgs_raw)
         except Exception:
             ref_imgs_raw = []
+    ref_list_raw = ref_imgs_raw
     ref_mode = (req.get("reference_mode") or "all").strip().lower()
     if ref_mode == "random1" and len(ref_list_raw) > 1:
         ref_list_raw = [random.choice(ref_list_raw)]
@@ -2770,43 +2771,44 @@ def generate_flow(req: dict):
     # Regex p/ extrair mediaId direto de URLs labs.google do Flow (form: .../edit/<UUID>)
     _LABS_EDIT_RE = re.compile(r"labs\.google/.*?/edit/([0-9a-fA-F-]{20,})")
     _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+    uploaded_any = False
     for ri in ref_list_raw:
         if isinstance(ri, dict):
-            ri = ri.get("name") or ri.get("media_id") or ri.get("url") or ri.get("base64") or ""
+            val = ri.get("name") or ri.get("media_id")
+            if not val:
+                val = ri.get("url") or ri.get("base64") or ri.get("preview_url") or ""
+            ri = val
         ri = (ri or "").strip()
         if not ri:
             continue
-        # Atalho: URL labs.google do Flow → extrai mediaId, sem upload (evita 401 no upload)
+        # Atalho: URL labs.google do Flow -> extrai mediaId, sem upload (evita 401 no upload)
         m = _LABS_EDIT_RE.search(ri)
         if m:
             media_name = m.group(1)
-            print(f"[Flow] ref labs.google URL → mediaId {media_name} (sem upload)")
+            print(f"[Flow] ref labs.google URL -> mediaId {media_name} (sem upload)")
         elif _UUID_RE.match(ri):
             media_name = ri  # bare UUID = mediaId pronto
-            print(f"[Flow] ref bare mediaId → {media_name}")
+            print(f"[Flow] ref bare mediaId -> {media_name}")
         elif ri.startswith("http") or ri.startswith("data:"):
             media_name = _flow_upload_reference(access_token=access_token, project_id=project_id, src=ri)
             if not media_name:
                 ref_failures.append({"src": ri[:120], "error": "upload ao Flow falhou (cookie pode estar expirado / 4xx)"})
                 print(f"[Flow] ref upload FALHOU, pulando: {ri[:80]}")
                 continue
+            uploaded_any = True
         else:
             media_name = ri  # qualquer outro: trata como mediaId/name do Flow
         image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
     references_requested = len([r for r in ref_list_raw if r])
     references_uploaded  = len(image_inputs)
-    # 2026-06-06: NARWHAL (nano_banana_2) SUPORTA imageInputs com mediaIds pré-existentes.
+    # 2026-06-06: NARWHAL (nano_banana_2) SUPORTA imageInputs com mediaIds pre-existentes.
     # Confirmado via curl real: imageModelName=NARWHAL + imageInputs[name=uuid] funciona.
-    # A restrição anterior (promover para GEM_PIX_2) era para uploads de bytes (data:/http),
-    # não para mediaIds já registrados no Flow. Como agora todas as refs são mediaIds,
-    # a promoção automática foi removida — o modelo solicitado é respeitado.
-    # Mantemos a promoção apenas se houver refs que precisaram de upload (data: ou http).
-    _has_uploaded_refs = any(
-        (ri if isinstance(ri, str) else (ri.get("url") or ri.get("base64") or "")).startswith(("http", "data:"))
-        for ri in ref_list_raw if ri
-    )
-    if image_inputs and model_name == "NARWHAL" and _has_uploaded_refs:
-        print(f"[Flow] refs com upload de bytes (n={len(image_inputs)}) → forçando GEM_PIX_2 (nano_banana_pro). NARWHAL não suporta imageInputs com bytes.")
+    # A restricao anterior (promover para GEM_PIX_2) era para uploads de bytes (data:/http),
+    # nao para mediaIds ja registrados no Flow. Como agora todas as refs sao mediaIds,
+    # a promocao automatica foi removida - o modelo solicitado eh respeitado.
+    # Mantemos a promocao apenas se houver refs que precisaram de upload (data: ou http).
+    if image_inputs and model_name == "NARWHAL" and uploaded_any:
+        print(f"[Flow] refs com upload de bytes (n={len(image_inputs)}) -> forcando GEM_PIX_2 (nano_banana_pro). NARWHAL nao suporta imageInputs com bytes.")
         model_name = "GEM_PIX_2"
         model_raw = "nano_banana_pro"
     print(f"[Flow] refs requested={references_requested} applied={references_uploaded} failed={len(ref_failures)} model_used={model_raw}")
