@@ -2818,6 +2818,14 @@ def generate_flow(req: dict):
         elif ref_list_raw:
             ref_list_raw = [ref_list_raw[0]]
     image_inputs: list = []
+    # 2026-06-09: Rastreia separadamente refs que precisaram de upload (data:/http) vs
+    # mediaIds pre-existentes. Usado no fallback staged de unsafe_generation em _one():
+    #   - Tentativa 1 (original): prompt + TODOS os refs
+    #   - Tentativa 2 (nova): prompt sanitizado + SÓ mediaIds pre-existentes (sem uploads)
+    #   - Tentativa 3 (nova): prompt sanitizado + SEM refs (geração limpa como fallback final)
+    # Isso resolve o caso em que o conteúdo da imagem enviada via upload (screenshot de YouTube
+    # com conteúdo dramático) aciona PUBLIC_ERROR_UNSAFE_GENERATION no lado do Flow.
+    mediaid_inputs: list = []   # refs que usaram mediaId direto (sem upload)
     ref_failures: list = []  # [{src, error}]
     # Regex p/ extrair mediaId direto de URLs labs.google do Flow (form: .../edit/<UUID>)
     _LABS_EDIT_RE = re.compile(r"labs\.google/.*?/edit/([0-9a-fA-F-]{20,})")
@@ -2836,9 +2844,11 @@ def generate_flow(req: dict):
         m = _LABS_EDIT_RE.search(ri)
         if m:
             media_name = m.group(1)
+            is_upload = False
             print(f"[Flow] ref labs.google URL -> mediaId {media_name} (sem upload)")
         elif _UUID_RE.match(ri):
             media_name = ri  # bare UUID = mediaId pronto
+            is_upload = False
             print(f"[Flow] ref bare mediaId -> {media_name}")
         elif ri.startswith("http") or ri.startswith("data:"):
             media_name = _flow_upload_reference(access_token=access_token, project_id=project_id, src=ri)
@@ -2846,10 +2856,15 @@ def generate_flow(req: dict):
                 ref_failures.append({"src": ri[:120], "error": "upload ao Flow falhou (cookie pode estar expirado / 4xx)"})
                 print(f"[Flow] ref upload FALHOU, pulando: {ri[:80]}")
                 continue
+            is_upload = True
             uploaded_any = True
         else:
             media_name = ri  # qualquer outro: trata como mediaId/name do Flow
-        image_inputs.append({"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name})
+            is_upload = False
+        entry = {"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": media_name}
+        image_inputs.append(entry)
+        if not is_upload:
+            mediaid_inputs.append(entry)
     references_requested = len([r for r in ref_list_raw if r])
     references_uploaded  = len(image_inputs)
     # 2026-06-06: NARWHAL (nano_banana_2) SUPORTA imageInputs com mediaIds pre-existentes.
@@ -2862,41 +2877,54 @@ def generate_flow(req: dict):
         print(f"[Flow] refs com upload de bytes (n={len(image_inputs)}) -> forcando GEM_PIX_2 (nano_banana_pro). NARWHAL nao suporta imageInputs com bytes.")
         model_name = "GEM_PIX_2"
         model_raw = "nano_banana_pro"
-    print(f"[Flow] refs requested={references_requested} applied={references_uploaded} failed={len(ref_failures)} model_used={model_raw}")
+    print(f"[Flow] refs requested={references_requested} applied={references_uploaded} uploaded={uploaded_any} mediaid_only={len(mediaid_inputs)} failed={len(ref_failures)} model_used={model_raw}")
 
     # Step 3: disparar N chamadas paralelas (cada uma com seed e recaptcha próprios)
     def _one(i: int) -> dict:
         p_current = prompt
-        res = _flow_call_single(
-            project_id=project_id,
-            access_token=access_token,
-            recaptcha_token=recaptcha_tokens[i],
-            batch_id=batch_id,
-            session_id=session_id,
-            model_name=model_name,
-            aspect_ratio=ar_value,
-            prompt=p_current,
-            seed=random.randint(1, 2 ** 31),
-            image_inputs=image_inputs,
-        )
+
+        def _call(rcap_token: str, p: str, inputs: list) -> dict:
+            return _flow_call_single(
+                project_id=project_id,
+                access_token=access_token,
+                recaptcha_token=rcap_token,
+                batch_id=batch_id,
+                session_id=session_id,
+                model_name=model_name,
+                aspect_ratio=ar_value,
+                prompt=p,
+                seed=random.randint(1, 2 ** 31),
+                image_inputs=inputs,
+            )
+
+        res = _call(recaptcha_tokens[i], p_current, image_inputs)
+
         if not res.get("ok") and res.get("unsafe_generation"):
-            # Obter novo token reCAPTCHA para tentar novamente
-            retry_tokens = _wait_for_recaptcha_tokens(1, timeout=5.0)
-            if retry_tokens:
+            # --- Tentativa 2: prompt sanitizado + todos os refs ---
+            t2 = _wait_for_recaptcha_tokens(1, timeout=5.0)
+            if t2:
                 sanitized_p = _sanitize_prompt_for_safety(p_current)
-                print(f"[Flow] Geracao {i} marcada como unsafe. Retentando com prompt higienizado: {sanitized_p[:150]}...")
-                res = _flow_call_single(
-                    project_id=project_id,
-                    access_token=access_token,
-                    recaptcha_token=retry_tokens[0],
-                    batch_id=batch_id,
-                    session_id=session_id,
-                    model_name=model_name,
-                    aspect_ratio=ar_value,
-                    prompt=sanitized_p,
-                    seed=random.randint(1, 2 ** 31),
-                    image_inputs=image_inputs,
-                )
+                print(f"[Flow] Geracao {i} unsafe (tentativa 1). Retry 2: prompt sanitizado + todos refs. prompt={sanitized_p[:120]}...")
+                res = _call(t2[0], sanitized_p, image_inputs)
+
+            # --- Tentativa 3: prompt sanitizado + SÓ mediaIds pre-existentes (sem uploads) ---
+            if not res.get("ok") and res.get("unsafe_generation") and uploaded_any and mediaid_inputs:
+                t3 = _wait_for_recaptcha_tokens(1, timeout=5.0)
+                if t3:
+                    sanitized_p = sanitized_p if 't2' in dir() else _sanitize_prompt_for_safety(p_current)
+                    print(f"[Flow] Geracao {i} unsafe (tentativa 2). Retry 3: prompt sanitizado + SÓ mediaIds pre-existentes ({len(mediaid_inputs)} refs).")
+                    res = _call(t3[0], sanitized_p, mediaid_inputs)
+
+            # --- Tentativa 4: prompt sanitizado + SEM refs (geração limpa) ---
+            if not res.get("ok") and res.get("unsafe_generation") and image_inputs:
+                t4 = _wait_for_recaptcha_tokens(1, timeout=5.0)
+                if t4:
+                    sanitized_p = sanitized_p if 't2' in dir() else _sanitize_prompt_for_safety(p_current)
+                    print(f"[Flow] Geracao {i} unsafe (tentativa 3). Retry 4: prompt sanitizado + SEM refs (fallback limpo).")
+                    res = _call(t4[0], sanitized_p, [])
+                    if res.get("ok"):
+                        res["refs_dropped_unsafe"] = True
+
         return res
 
     results: list[dict] = []
