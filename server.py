@@ -2900,27 +2900,27 @@ def generate_flow(req: dict):
         res = _call(recaptcha_tokens[i], p_current, image_inputs)
 
         if not res.get("ok") and res.get("unsafe_generation"):
+            # sanitized_p calculado UMA VEZ aqui — evita UnboundLocalError nos branches abaixo
+            sanitized_p = _sanitize_prompt_for_safety(p_current)
+
             # --- Tentativa 2: prompt sanitizado + todos os refs ---
             t2 = _wait_for_recaptcha_tokens(1, timeout=5.0)
             if t2:
-                sanitized_p = _sanitize_prompt_for_safety(p_current)
-                print(f"[Flow] Geracao {i} unsafe (tentativa 1). Retry 2: prompt sanitizado + todos refs. prompt={sanitized_p[:120]}...")
+                print(f"[Flow] Geracao {i} unsafe (T1). Retry T2: prompt sanitizado + todos refs. prompt={sanitized_p[:120]}...")
                 res = _call(t2[0], sanitized_p, image_inputs)
 
-            # --- Tentativa 3: prompt sanitizado + SÓ mediaIds pre-existentes (sem uploads) ---
+            # --- Tentativa 3: prompt sanitizado + SÓ mediaIds pré-existentes (sem uploads) ---
             if not res.get("ok") and res.get("unsafe_generation") and uploaded_any and mediaid_inputs:
                 t3 = _wait_for_recaptcha_tokens(1, timeout=5.0)
                 if t3:
-                    sanitized_p = sanitized_p if 't2' in dir() else _sanitize_prompt_for_safety(p_current)
-                    print(f"[Flow] Geracao {i} unsafe (tentativa 2). Retry 3: prompt sanitizado + SÓ mediaIds pre-existentes ({len(mediaid_inputs)} refs).")
+                    print(f"[Flow] Geracao {i} unsafe (T2). Retry T3: prompt sanitizado + SÓ mediaIds ({len(mediaid_inputs)} refs).")
                     res = _call(t3[0], sanitized_p, mediaid_inputs)
 
-            # --- Tentativa 4: prompt sanitizado + SEM refs (geração limpa) ---
+            # --- Tentativa 4: prompt sanitizado + SEM refs (fallback limpo) ---
             if not res.get("ok") and res.get("unsafe_generation") and image_inputs:
                 t4 = _wait_for_recaptcha_tokens(1, timeout=5.0)
                 if t4:
-                    sanitized_p = sanitized_p if 't2' in dir() else _sanitize_prompt_for_safety(p_current)
-                    print(f"[Flow] Geracao {i} unsafe (tentativa 3). Retry 4: prompt sanitizado + SEM refs (fallback limpo).")
+                    print(f"[Flow] Geracao {i} unsafe (T3). Retry T4: prompt sanitizado + SEM refs.")
                     res = _call(t4[0], sanitized_p, [])
                     if res.get("ok"):
                         res["refs_dropped_unsafe"] = True
