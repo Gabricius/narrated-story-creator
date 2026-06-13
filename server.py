@@ -2148,6 +2148,9 @@ def upload_to_supabase_storage(
                 "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                 "Content-Type": content_type,
                 "x-upsert": "true",
+                # Egress: cache longo no CDN/browser. Nomes de arquivo são únicos por
+                # geração, então imutável é seguro (nunca sobrescreve conteúdo diferente).
+                "Cache-Control": "public, max-age=31536000, immutable",
             },
             data=image_bytes,
             timeout=timeout,
