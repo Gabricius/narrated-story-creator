@@ -1524,13 +1524,17 @@ def upload_local_to_drive(video_id: str = None):
 
 @app.post("/tts")
 async def tts_preview(request: Request):
-    """Generate a short TTS audio preview for a given voice.
-    Body: { "text": "...", "voice": "af_heart", "speed": 1.0 }
-    Returns: WAV audio blob (audio/wav).
+    """Generate a TTS audio for a given voice.
+    Body: { "text": "...", "voice": "af_heart", "speed": 1.0, "format": "mp3"|"wav" }
+    Returns: audio blob. Default format is wav. Pass "mp3" for compressed output
+    (~10x menor — usado pelo pipeline Rede Z p/ economizar storage e egress no Supabase).
     """
     body = await request.json()
     text  = str(body.get("text", "Hello, this is a voice preview sample.")).strip()
     voice = str(body.get("voice", "af_heart")).strip()
+    fmt   = str(body.get("format", "wav")).strip().lower()
+    if fmt not in ("wav", "mp3"):
+        fmt = "wav"
 
     if voice not in LANGUAGE_VOICE_MAP:
         return JSONResponse({"error": f"Unknown voice: {voice}"}, status_code=400)
@@ -1542,23 +1546,39 @@ async def tts_preview(request: Request):
     text = normalize_text_for_tts(text)
 
     tmp_path = f"/tmp/tts_preview_{uuid.uuid4().hex}.wav"
+    mp3_path = tmp_path[:-4] + ".mp3"
+    cleanup_paths = [tmp_path]
     try:
         if is_international:
             create_tts_international(text, tmp_path, lang_code, voice)
         else:
             create_tts_english(text, tmp_path, lang_code, voice)
 
+        if fmt == "mp3":
+            # Transcodifica WAV -> MP3 (libmp3lame ~192kbps VBR). Reduz ~10x o tamanho.
+            cleanup_paths.append(mp3_path)
+            res = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-y", "-i", tmp_path,
+                 "-codec:a", "libmp3lame", "-q:a", "2", mp3_path],
+                capture_output=True, text=True,
+            )
+            if res.returncode != 0 or not os.path.exists(mp3_path):
+                raise RuntimeError(f"ffmpeg mp3 transcode failed: {res.stderr[-400:]}")
+            return FileResponse(mp3_path, media_type="audio/mpeg", background=None)
+
         return FileResponse(tmp_path, media_type="audio/wav", background=None)
     except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for p in cleanup_paths:
+            if os.path.exists(p):
+                os.remove(p)
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         # Schedule cleanup after response is sent
         async def _cleanup():
             await asyncio.sleep(10)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            for p in cleanup_paths:
+                if os.path.exists(p):
+                    os.remove(p)
         asyncio.create_task(_cleanup())
 
 
