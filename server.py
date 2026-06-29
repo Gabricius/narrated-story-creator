@@ -1547,12 +1547,30 @@ async def tts_preview(request: Request):
 
     tmp_path = f"/tmp/tts_preview_{uuid.uuid4().hex}.wav"
     mp3_path = tmp_path[:-4] + ".mp3"
-    cleanup_paths = [tmp_path]
+    text_path = tmp_path[:-4] + ".txt"
+    cleanup_paths = [tmp_path, text_path]
     try:
-        if is_international:
-            create_tts_international(text, tmp_path, lang_code, voice)
-        else:
-            create_tts_english(text, tmp_path, lang_code, voice)
+        # OOM FIX: roda o modelo TTS num SUBPROCESSO isolado (mesmo padrao de
+        # create_tts_chunked). Cada chamada /tts libera 100% da memoria ao
+        # terminar, evitando o acumulo de memoria que derrubava o servidor (OOM)
+        # no meio de producoes longas (26-32 chunks) -> "connection aborted".
+        with open(text_path, "w", encoding="utf-8") as _tf:
+            _tf.write(text)
+        _tts_func = "create_tts_international" if is_international else "create_tts_english"
+        _worker = (
+            "import sys; sys.path.insert(0, '/app')\n"
+            f"from video_maker import {_tts_func}\n"
+            f"_text = open({text_path!r}, encoding='utf-8').read()\n"
+            f"{_tts_func}(text=_text, output_path={tmp_path!r}, lang_code={lang_code!r}, voice={voice!r})\n"
+        )
+        _res = subprocess.run(
+            ["python3", "-c", _worker],
+            capture_output=True, text=True, timeout=600, cwd="/app",
+        )
+        if _res.returncode != 0 or not os.path.exists(tmp_path):
+            raise RuntimeError(
+                f"TTS subprocess failed/OOM (exit {_res.returncode}): {(_res.stderr or '')[-500:]}"
+            )
 
         if fmt == "mp3":
             # Transcodifica WAV -> MP3 (libmp3lame ~192kbps VBR). Reduz ~10x o tamanho.
@@ -1814,6 +1832,47 @@ FLOW_VIDEOS_BUCKET = "flow-videos"
 FLOW_VIDEOS_DIR = os.path.join(os.getcwd(), "flow_videos_output")
 os.makedirs(FLOW_VIDEOS_DIR, exist_ok=True)
 
+# --- Cloudflare R2 (via Worker proxy) -------------------------------------
+# Migração 2026-06: storage saiu do Supabase para o R2. As chamadas de BANCO
+# (PostgREST) continuam no Supabase; só o object storage mudou. Tudo passa pelo
+# Worker `yt-revenge-r2-proxy` (bucket privado + porta autenticada): ver
+# cloudflare-worker/ na raiz do repo.
+from urllib.parse import quote as _urlquote
+
+R2_WORKER_BASE = os.environ.get(
+    "R2_WORKER_BASE", "https://yt-revenge-r2-proxy.davidgabricio.workers.dev"
+).rstrip("/")
+R2_UPLOAD_SECRET = os.environ.get("R2_UPLOAD_SECRET", "")
+R2_IMMUTABLE_CC = "public, max-age=31536000, immutable"
+
+
+def _r2_key(filename: str) -> str:
+    # preserva as barras do path (ex.: <prod>/audioN.mp3), encoda o resto
+    return _urlquote(filename, safe="/~")
+
+
+def r2_public_url(bucket: str, filename: str) -> str:
+    return f"{R2_WORKER_BASE}/f/{bucket}/{_r2_key(filename)}"
+
+
+def r2_upload(bucket: str, filename: str, data: bytes,
+              content_type: str = "application/octet-stream",
+              cache_control: str = R2_IMMUTABLE_CC, timeout: int = 30) -> str:
+    """Sobe bytes para o R2 via Worker (PUT /up). Retorna a URL pública (/f).
+    Levanta em erro HTTP."""
+    resp = requests.put(
+        f"{R2_WORKER_BASE}/up/{bucket}/{_r2_key(filename)}",
+        headers={
+            "x-auth": R2_UPLOAD_SECRET,
+            "Content-Type": content_type,
+            "Cache-Control": cache_control,
+        },
+        data=data,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return r2_public_url(bucket, filename)
+
 def update_production_progress(production_id: str, progress: dict):
     """Update processing_progress JSONB on the productions row in Supabase.
 
@@ -1838,52 +1897,15 @@ def update_production_progress(production_id: str, progress: dict):
         pass
 
 def ensure_supabase_bucket(bucket_name: str = None):
-    """Ensure a Supabase Storage bucket exists (create if missing, public).
+    """No-op pós-migração R2: os buckets do R2 são criados fora da app
+    (ver cloudflare-worker/DEPLOY.md). Mantido só por compat de call-site."""
+    return True
 
-    Args:
-      bucket_name: nome do bucket; default = IMAGEFX_BUCKET (retro-compat).
-    Returns:
-      True se existir ou foi criado; False em qualquer erro.
-    """
-    if bucket_name is None:
-        bucket_name = IMAGEFX_BUCKET
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        return False
-    log_prefix = f"[Storage:{bucket_name}]"
-    try:
-        # Check if bucket exists
-        resp = requests.get(
-            f"{SUPABASE_URL}/storage/v1/bucket/{bucket_name}",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            print(f"{log_prefix} bucket exists")
-            return True
-
-        # Create bucket (public)
-        resp = requests.post(
-            f"{SUPABASE_URL}/storage/v1/bucket",
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"},
-            json={"id": bucket_name, "name": bucket_name, "public": True},
-            timeout=10
-        )
-        if resp.status_code in (200, 201):
-            print(f"{log_prefix} created (public)")
-            return True
-        else:
-            print(f"{log_prefix} failed to create: {resp.status_code} {resp.text[:200]}")
-            return False
-    except Exception as e:
-        print(f"{log_prefix} check error: {e}")
-        return False
-
-# Try to create buckets on startup
-if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-    ensure_supabase_bucket(IMAGEFX_BUCKET)
-    ensure_supabase_bucket(FLOW_VIDEOS_BUCKET)
+# Storage agora é R2 (via Worker). Buckets já existem; nada a criar no startup.
+if R2_UPLOAD_SECRET:
+    print(f"[Storage] R2 via Worker: {R2_WORKER_BASE}")
 else:
-    print("[Storage] Supabase Storage not configured — images/videos will be local only")
+    print("[Storage] R2 não configurado (R2_UPLOAD_SECRET) — uploads serão pulados")
 
 
 # ═══════════════════════════════
@@ -2158,29 +2180,15 @@ def upload_to_supabase_storage(
     """
     if bucket is None:
         bucket = IMAGEFX_BUCKET
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print(f"[Storage:{bucket}] Supabase Storage not configured, skipping upload")
+    if not R2_UPLOAD_SECRET:
+        print(f"[Storage:{bucket}] R2 not configured (R2_UPLOAD_SECRET), skipping upload")
         return None
     try:
-        resp = requests.post(
-            f"{SUPABASE_URL}/storage/v1/object/{bucket}/{filename}",
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                "Content-Type": content_type,
-                "x-upsert": "true",
-                # Egress: cache longo no CDN/browser. Nomes de arquivo são únicos por
-                # geração, então imutável é seguro (nunca sobrescreve conteúdo diferente).
-                "Cache-Control": "public, max-age=31536000, immutable",
-            },
-            data=image_bytes,
-            timeout=timeout,
-        )
-        if resp.status_code in (200, 201):
-            public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{filename}"
-            return public_url
-        else:
-            print(f"[Storage:{bucket}] upload failed: {resp.status_code} {resp.text[:200]}")
-            return None
+        # Migração R2: sobe para o Worker e devolve a URL pública (/f). Mesma
+        # assinatura/retorno de antes — call-sites não mudam. Cache imutável
+        # mantém o ganho de egress (nomes são únicos por geração).
+        return r2_upload(bucket, filename, image_bytes,
+                         content_type=content_type, timeout=timeout)
     except Exception as e:
         print(f"[Storage:{bucket}] upload error: {e}")
         return None
@@ -4089,24 +4097,13 @@ def safe_filename(name: str) -> str | None:
 
 
 def _thumb_supabase_upload(url: str, key: str, bucket: str, png_bytes: bytes, filename: str) -> str:
-    """Uploads PNG bytes to Supabase storage and returns the public URL."""
-    base = url.rstrip("/")
-    target = f"{base}/storage/v1/object/{bucket}/{filename}"
-    r = requests.post(
-        target,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "apikey": key,
-            "Content-Type": "image/png",
-            "x-upsert": "true",
-            "Cache-Control": "public, max-age=31536000, immutable",
-        },
-        data=png_bytes,
-        timeout=30,
-    )
-    if not r.ok:
-        raise RuntimeError(f"Supabase upload failed {r.status_code}: {r.text[:300]}")
-    return f"{base}/storage/v1/object/public/{bucket}/{filename}"
+    """Sobe o PNG para o R2 (via Worker) e devolve a URL pública.
+    Migração R2: os parâmetros `url`/`key` (creds Supabase vindas do n8n) são
+    ignorados — usamos as credenciais R2 do servidor. Assinatura mantida p/ compat.
+    """
+    if not R2_UPLOAD_SECRET:
+        raise RuntimeError("R2 não configurado (R2_UPLOAD_SECRET) no servidor")
+    return r2_upload(bucket, filename, png_bytes, content_type="image/png")
 
 
 @app.post("/render")
