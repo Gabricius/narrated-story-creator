@@ -1522,6 +1522,9 @@ def upload_local_to_drive(video_id: str = None):
     
     return {"uploaded": len([r for r in results if r["status"] == "uploaded"]), "results": results}
 
+# Lock global: garante UMA geracao TTS por vez (evita pico de memoria por concorrencia)
+_TTS_LOCK = asyncio.Lock()
+
 @app.post("/tts")
 async def tts_preview(request: Request):
     """Generate a TTS audio for a given voice.
@@ -1563,10 +1566,15 @@ async def tts_preview(request: Request):
             f"_text = open({text_path!r}, encoding='utf-8').read()\n"
             f"{_tts_func}(text=_text, output_path={tmp_path!r}, lang_code={lang_code!r}, voice={voice!r})\n"
         )
-        _res = subprocess.run(
-            ["python3", "-c", _worker],
-            capture_output=True, text=True, timeout=600, cwd="/app",
-        )
+        # ANTI-OVERLOAD: serializa o TTS (1 por vez) e roda fora do event loop
+        # (asyncio.to_thread) — a "conexao incessante e direta" nunca dispara dois
+        # subprocessos ao mesmo tempo, e o servidor continua respondendo health-checks.
+        async with _TTS_LOCK:
+            _res = await asyncio.to_thread(
+                subprocess.run,
+                ["python3", "-c", _worker],
+                capture_output=True, text=True, timeout=600, cwd="/app",
+            )
         if _res.returncode != 0 or not os.path.exists(tmp_path):
             raise RuntimeError(
                 f"TTS subprocess failed/OOM (exit {_res.returncode}): {(_res.stderr or '')[-500:]}"
